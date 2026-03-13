@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RiviumSync Web SDK Example</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>RiviumSync Web SDK Example</h1>
+        <p class="subtitle">Demonstrating CRUD, Queries, Batch Operations & Realtime Sync</p>
+      </header>
+
+      <nav class="tabs">
+        <button class="tab active" data-tab="crud">CRUD Operations</button>
+        <button class="tab" data-tab="query">Queries</button>
+        <button class="tab" data-tab="batch">Batch Operations</button>
+        <button class="tab" data-tab="realtime">Realtime</button>
+        <button class="tab" data-tab="offline">Offline</button>
+      </nav>
+
+      <!-- CRUD Tab -->
+      <section id="crud-tab" class="tab-content active">
+        <div class="card">
+          <h2>Create Document</h2>
+          <form id="create-form">
+            <div class="form-group">
+              <label for="title">Title</label>
+              <input type="text" id="title" placeholder="Enter title" required />
+            </div>
+            <div class="form-group">
+              <label for="description">Description</label>
+              <textarea id="description" placeholder="Enter description"></textarea>
+            </div>
+            <button type="submit" class="btn btn-primary">Create Document</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2>Documents</h2>
+            <button id="refresh-btn" class="btn btn-secondary">Refresh</button>
+          </div>
+          <div id="documents-list" class="documents-list">
+            <p class="empty-state">Loading documents...</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Last Operation Result</h2>
+          <pre id="crud-result" class="result-box">No operations yet</pre>
+        </div>
+      </section>
+
+      <!-- Query Tab -->
+      <section id="query-tab" class="tab-content">
+        <div class="card">
+          <h2>Query Documents</h2>
+          <div class="query-builder">
+            <div class="form-group">
+              <label for="query-field">Field</label>
+              <input type="text" id="query-field" placeholder="e.g., completed" value="completed" />
+            </div>
+            <div class="form-group">
+              <label for="query-operator">Operator</label>
+              <select id="query-operator">
+                <option value="==">== (Equal)</option>
+                <option value="!=">!= (Not Equal)</option>
+                <option value=">">&#62; (Greater Than)</option>
+                <option value=">=">&#62;= (Greater or Equal)</option>
+                <option value="<">&#60; (Less Than)</option>
+                <option value="<=">&#60;= (Less or Equal)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="query-value">Value</label>
+              <input type="text" id="query-value" placeholder="e.g., true" value="false" />
+            </div>
+            <div class="form-group">
+              <label for="query-orderby">Order By</label>
+              <input type="text" id="query-orderby" placeholder="e.g., createdAt" />
+            </div>
+            <div class="form-group">
+              <label for="query-limit">Limit</label>
+              <input type="number" id="query-limit" placeholder="e.g., 10" value="10" />
+            </div>
+            <button id="run-query-btn" class="btn btn-primary">Run Query</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Query Results</h2>
+          <pre id="query-result" class="result-box">Run a query to see results</pre>
+        </div>
+      </section>
+
+      <!-- Batch Tab -->
+      <section id="batch-tab" class="tab-content">
+        <div class="card">
+          <h2>Batch Operations</h2>
+          <p class="hint">Batch operations are atomic - all succeed or all fail</p>
+          <div class="button-group">
+            <button id="batch-create-btn" class="btn btn-primary">Batch Create (3 docs)</button>
+            <button id="batch-update-btn" class="btn btn-secondary">Batch Update All</button>
+            <button id="batch-delete-btn" class="btn btn-danger">Batch Delete Completed</button>
+            <button id="batch-mixed-btn" class="btn btn-secondary">Mixed Operations</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Batch Result</h2>
+          <pre id="batch-result" class="result-box">No batch operations yet</pre>
+        </div>
+      </section>
+
+      <!-- Realtime Tab -->
+      <section id="realtime-tab" class="tab-content">
+        <div class="card">
+          <div class="card-header">
+            <h2>Realtime Listener</h2>
+            <div class="listener-status" id="listener-status">
+              <span class="status-dot inactive"></span>
+              <span>Inactive</span>
+            </div>
+          </div>
+          <div class="button-group">
+            <button id="start-listener-btn" class="btn btn-primary">Start Listening</button>
+            <button id="stop-listener-btn" class="btn btn-secondary" disabled>Stop Listening</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Event Log</h2>
+          <div id="event-log" class="event-log">
+            <p class="empty-state">Start the listener to see realtime events</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Test Actions</h2>
+          <p class="hint">Create changes to see realtime updates</p>
+          <div class="button-group">
+            <button id="realtime-create-btn" class="btn btn-secondary">Create Test Doc</button>
+            <button id="realtime-update-btn" class="btn btn-secondary">Update Random Doc</button>
+            <button id="realtime-delete-btn" class="btn btn-secondary">Delete Random Doc</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Offline Tab -->
+      <section id="offline-tab" class="tab-content">
+        <div class="card">
+          <div class="card-header">
+            <h2>Offline Status</h2>
+            <div class="offline-status" id="offline-status">
+              <span class="status-dot" id="online-dot"></span>
+              <span id="online-status-text">Checking...</span>
+            </div>
+          </div>
+          <div class="status-grid">
+            <div class="status-item">
+              <span class="status-label">Sync State:</span>
+              <span id="sync-state" class="status-value">-</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Pending Writes:</span>
+              <span id="pending-count" class="status-value">0</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Connection:</span>
+              <span id="connection-state" class="status-value">-</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Offline Controls</h2>
+          <p class="hint">Test offline functionality by simulating network changes</p>
+          <div class="button-group">
+            <button id="go-offline-btn" class="btn btn-secondary">Go Offline</button>
+            <button id="go-online-btn" class="btn btn-primary">Go Online</button>
+            <button id="force-sync-btn" class="btn btn-secondary">Force Sync Now</button>
+            <button id="clear-cache-btn" class="btn btn-danger">Clear Cache</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Offline Test</h2>
+          <p class="hint">Create documents while offline - they'll sync when back online</p>
+          <div class="button-group">
+            <button id="offline-create-btn" class="btn btn-primary">Create While Offline</button>
+            <button id="offline-update-btn" class="btn btn-secondary">Update While Offline</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Offline Log</h2>
+          <div id="offline-log" class="event-log">
+            <p class="empty-state">Offline events will appear here</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Code Examples -->
+      <div class="card code-examples">
+        <h2>Code Examples</h2>
+        <details>
+          <summary>Initialize SDK</summary>
+          <pre><code>import { RiviumSync } from '@rivium/sync-web';
+
+await RiviumSync.init({
+  apiKey: 'your-api-key',
+  offlineEnabled: true,
+  debugMode: true,
+});
+
+const db = RiviumSync.database('your-database-id');
+const collection = db.collection('todos');</code></pre>
+        </details>
+        <details>
+          <summary>CRUD Operations</summary>
+          <pre><code>// Create
+const doc = await collection.add({
+  title: 'My Task',
+  completed: false,
+});
+
+// Read
+const doc = await collection.get('doc-id');
+
+// Update
+await collection.update('doc-id', { completed: true });
+
+// Delete
+await collection.delete('doc-id');</code></pre>
+        </details>
+        <details>
+          <summary>Queries</summary>
+          <pre><code>// Query with filters
+const results = await collection.query({
+  filters: [
+    { field: 'completed', operator: '==', value: false },
+    { field: 'priority', operator: '>=', value: 5 },
+  ],
+  orderBy: 'createdAt',
+  orderDirection: 'desc',
+  limit: 10,
+});</code></pre>
+        </details>
+        <details>
+          <summary>Batch Operations</summary>
+          <pre><code>const batch = db.batch();
+
+batch.set(collection, 'doc1', { name: 'Alice' });
+batch.update(collection, 'doc2', { status: 'active' });
+batch.delete(collection, 'doc3');
+
+await batch.commit(); // Atomic</code></pre>
+        </details>
+        <details>
+          <summary>Realtime Listeners</summary>
+          <pre><code>// Listen to collection changes
+const unsubscribe = collection.onSnapshot((documents) => {
+  console.log('Collection updated:', documents.length);
+});
+
+// Stop listening
+unsubscribe();</code></pre>
+        </details>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

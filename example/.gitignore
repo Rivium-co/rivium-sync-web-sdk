@@ -1,0 +1,5 @@
+node_modules/
+dist/
+src/config.ts
+.DS_Store
+*.log
