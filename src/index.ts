@@ -157,8 +157,24 @@ export interface RiviumSyncConfig {
   /** Your RiviumSync API key - REQUIRED */
   apiKey: string;
   /** Optional user/device identifier for Security Rules (used as auth.uid).
-   *  If not provided, a random ID is generated and persisted in localStorage. */
+   *
+   *  NOTE: this is a plain string the client chooses, so the server cannot trust
+   *  it - anyone who unpacks your app can change it. Projects that enforce
+   *  `requireSignedTokens` reject it. Use `tokenProvider` instead. */
   userId?: string;
+  /**
+   * Returns a user token for the signed-in user, minted by YOUR server.
+   *
+   * Your backend calls `POST /users/token` with your API key AND your server
+   * secret (never ship the secret in an app) and returns the token. The SDK
+   * sends it on every request, refreshes it shortly before it expires, and
+   * fetches a new one if the server says it expired. This is what makes
+   * `auth.uid` in Security Rules trustworthy.
+   */
+  tokenProvider?: () => string | Promise<string>;
+  /** A user token you already hold. `tokenProvider` is preferred: a static
+   *  token cannot be refreshed when it expires. */
+  userToken?: string;
   /** JWT token from AuthLeap for authentication */
   authToken?: string;
   /** Maximum reconnect attempts (default: 10) */
@@ -1064,21 +1080,122 @@ class RiviumSync {
     return `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
   }
 
+  /** Seconds before expiry at which a token is replaced. */
+  private static readonly TOKEN_REFRESH_SKEW_S = 60;
+
+  /** Project the API key belongs to, from POST /connections/token. */
+  private projectId: string | null = null;
+
+  private userToken?: string;
+  private userTokenExpiresAt = 0;
+  private userTokenInFlight?: Promise<string | undefined>;
+
+  /** Seconds since the epoch at which this token expires, 0 if unreadable. */
+  private tokenExpiry(token: string): number {
+    try {
+      const [, payload] = token.split('.');
+      const json = JSON.parse(
+        decodeURIComponent(
+          atob(payload.replace(/-/g, '+').replace(/_/g, '/'))
+            .split('')
+            .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+            .join(''),
+        ),
+      );
+      return typeof json.exp === 'number' ? json.exp : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   /**
-   * Build common headers for API requests (includes X-User-Id for Security Rules)
+   * The current user token, fetched through `tokenProvider` when needed.
+   *
+   * Refreshes shortly before expiry so a long-lived app does not discover the
+   * expiry through a failed write. Concurrent callers share one in-flight fetch.
    */
-  private buildHeaders(): Record<string, string> {
+  private async ensureUserToken(): Promise<string | undefined> {
+    if (this.config.userToken) return this.config.userToken;
+    if (!this.config.tokenProvider) return undefined;
+
+    const nowS = Math.floor(Date.now() / 1000);
+    if (this.userToken && this.userTokenExpiresAt - RiviumSync.TOKEN_REFRESH_SKEW_S > nowS) {
+      return this.userToken;
+    }
+    if (this.userTokenInFlight) return this.userTokenInFlight;
+
+    this.userTokenInFlight = (async () => {
+      try {
+        const token = await this.config.tokenProvider!();
+        this.userToken = token;
+        this.userTokenExpiresAt = this.tokenExpiry(token);
+        return token;
+      } catch (e) {
+        this.log(RiviumSyncLogLevel.ERROR, 'tokenProvider failed:', e);
+        // Keep the old token: it may still be valid, and failing the request
+        // outright would be worse than letting the server decide.
+        return this.userToken;
+      } finally {
+        this.userTokenInFlight = undefined;
+      }
+    })();
+
+    return this.userTokenInFlight;
+  }
+
+  /** Drop the cached token so the next request fetches a fresh one. */
+  private invalidateUserToken(): void {
+    this.userToken = undefined;
+    this.userTokenExpiresAt = 0;
+  }
+
+  /**
+   * Build common headers for API requests.
+   *
+   * Sends the signed user token when one is available; falls back to the
+   * client-chosen `X-User-Id` only when it is not, because a project that
+   * enforces `requireSignedTokens` refuses that header.
+   */
+  private async buildHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'x-api-key': this.config.apiKey,
-      'X-User-Id': this.userId,
     };
+
+    const token = await this.ensureUserToken();
+    if (token) {
+      headers['X-User-Token'] = token;
+    } else {
+      headers['X-User-Id'] = this.userId;
+    }
 
     if (this.config.authToken) {
       headers['Authorization'] = `Bearer ${this.config.authToken}`;
     }
 
     return headers;
+  }
+
+  /**
+   * Every API call goes through here, so identity and expiry are handled once.
+   *
+   * On `token_expired` the token is dropped and the request retried once; the
+   * caller never sees a transient expiry.
+   */
+  private async authedFetch(url: string, init: RequestInit = {}, retry = true): Promise<Response> {
+    const headers = { ...(await this.buildHeaders()), ...((init.headers as Record<string, string>) ?? {}) };
+    // The one place that calls fetch directly - everything else goes through here.
+    const response = await fetch(url, { ...init, headers });
+
+    if (response.status === 401 && retry && (this.config.tokenProvider || this.config.userToken)) {
+      const body = await response.clone().json().catch(() => null);
+      if (body?.code === 'token_expired') {
+        this.invalidateUserToken();
+        return this.authedFetch(url, init, false);
+      }
+    }
+
+    return response;
   }
 
   // ==========================================================================
@@ -1107,9 +1224,8 @@ class RiviumSync {
       this.log(RiviumSyncLogLevel.DEBUG, 'Fetching MQTT token...');
 
       // Fetch JWT token from API (validates API key, returns short-lived token)
-      const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/connections/token`, {
+      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/connections/token`, {
         method: 'POST',
-        headers: this.buildHeaders(),
       });
 
       if (!response.ok) {
@@ -1117,6 +1233,11 @@ class RiviumSync {
       }
 
       const tokenData = await response.json();
+
+      // Topics are `rivium_sync/{projectId}/{databaseName}/{collectionName}/...`.
+      // The names are the ones the app already uses; the project id comes from
+      // the server, so the same database name in two projects cannot collide.
+      this.projectId = tokenData.projectId ?? null;
 
       this.mqttConfig = {
         host: RiviumSync.MQTT_WS_HOST,
@@ -1166,11 +1287,9 @@ class RiviumSync {
    * List all databases
    */
   async listDatabases(): Promise<DatabaseInfo[]> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases`, {
       method: 'GET',
-      headers,
     });
 
     if (!response.ok) {
@@ -1185,11 +1304,9 @@ class RiviumSync {
    * Create a new database
    */
   async createDatabase(name: string): Promise<DatabaseInfo> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases`, {
       method: 'POST',
-      headers,
       body: JSON.stringify({ name }),
     });
 
@@ -1205,11 +1322,9 @@ class RiviumSync {
    * Delete a database
    */
   async deleteDatabase(databaseId: string): Promise<void> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}`, {
       method: 'DELETE',
-      headers,
     });
 
     if (!response.ok) {
@@ -1221,11 +1336,9 @@ class RiviumSync {
    * List all collections in a database
    */
   async listCollections(databaseId: string): Promise<CollectionInfo[]> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections`, {
       method: 'GET',
-      headers,
     });
 
     if (!response.ok) {
@@ -1240,11 +1353,9 @@ class RiviumSync {
    * Create a new collection in a database
    */
   async createCollection(databaseId: string, name: string): Promise<CollectionInfo> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections`, {
       method: 'POST',
-      headers,
       body: JSON.stringify({ name }),
     });
 
@@ -1281,11 +1392,9 @@ class RiviumSync {
    * Execute a batch of operations atomically (internal use)
    */
   async executeBatch(operations: BatchOperation[]): Promise<void> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/batch/sdk`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/batch/sdk`, {
       method: 'POST',
-      headers,
       body: JSON.stringify({ operations }),
     });
 
@@ -1489,18 +1598,9 @@ class RiviumSync {
     const path = `/${databaseId}/${collectionId}/${documentId}`;
 
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-      };
 
-      if (this.config.authToken) {
-        headers['Authorization'] = `Bearer ${this.config.authToken}`;
-      }
-
-      const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
         method: 'GET',
-        headers,
       });
 
       if (response.status === 404) {
@@ -1563,14 +1663,6 @@ class RiviumSync {
     }
 
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-      };
-
-      if (this.config.authToken) {
-        headers['Authorization'] = `Bearer ${this.config.authToken}`;
-      }
 
       const queryParams = new URLSearchParams();
       if (options?.filters && options.filters.length > 0) {
@@ -1609,9 +1701,8 @@ class RiviumSync {
 
       const url = `${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk?${queryParams}`;
 
-      const response = await fetch(url, {
+      const response = await this.authedFetch(url, {
         method: 'GET',
-        headers,
       });
 
       if (!response.ok) {
@@ -1685,18 +1776,9 @@ class RiviumSync {
 
     // Online: make API call
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-      };
 
-      if (this.config.authToken) {
-        headers['Authorization'] = `Bearer ${this.config.authToken}`;
-      }
-
-      const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk`, {
+      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk`, {
         method: 'POST',
-        headers,
         body: JSON.stringify({ data }),
       });
 
@@ -1787,18 +1869,9 @@ class RiviumSync {
 
     // Online: make API call
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-      };
 
-      if (this.config.authToken) {
-        headers['Authorization'] = `Bearer ${this.config.authToken}`;
-      }
-
-      const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
         method: 'PUT',
-        headers,
         body: JSON.stringify({ data }),
       });
 
@@ -1867,18 +1940,9 @@ class RiviumSync {
 
     // Online: make API call
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-      };
 
-      if (this.config.authToken) {
-        headers['Authorization'] = `Bearer ${this.config.authToken}`;
-      }
-
-      const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
         method: 'PATCH',
-        headers,
         body: JSON.stringify({ data }),
       });
 
@@ -1939,18 +2003,9 @@ class RiviumSync {
 
     // Online: make API call
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-      };
 
-      if (this.config.authToken) {
-        headers['Authorization'] = `Bearer ${this.config.authToken}`;
-      }
-
-      const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
         method: 'DELETE',
-        headers,
       });
 
       if (!response.ok) {
@@ -1993,8 +2048,7 @@ class RiviumSync {
 
   listenDocument<T>(databaseId: string, collectionId: string, documentId: string, callback: DocumentListener<T>): Unsubscribe {
     const path = `/${databaseId}/${collectionId}/${documentId}`;
-    // Topic format matches backend: rivium_sync/{databaseId}/{collectionId}/{documentId}
-    const mqttTopic = `rivium_sync/${databaseId}/${collectionId}/${documentId}`;
+    const mqttTopic = this.topicFor(databaseId, collectionId, documentId);
 
     // Add to listeners
     if (!this.documentListeners.has(path)) {
@@ -2031,8 +2085,7 @@ class RiviumSync {
 
   listenCollection<T>(databaseId: string, collectionId: string, callback: CollectionListener<T>, options?: QueryOptions): Unsubscribe {
     const path = `/${databaseId}/${collectionId}`;
-    // Topic format matches backend: rivium_sync/{databaseId}/{collectionId}/+ (wildcard for all documents)
-    const mqttTopic = `rivium_sync/${databaseId}/${collectionId}/+`;
+    const mqttTopic = this.topicFor(databaseId, collectionId, '+');
 
     // Add to listeners
     if (!this.collectionListeners.has(path)) {
@@ -2076,10 +2129,23 @@ class RiviumSync {
   // Private - MQTT Connection
   // ==========================================================================
 
+  /**
+   * Drop the current client without letting it trigger a reconnect.
+   *
+   * `end()` fires 'close', and that handler schedules a reconnect - so tearing
+   * a client down would immediately bring another one back, each time opening a
+   * fresh WebSocket. Detaching the handlers first is what makes an intentional
+   * teardown intentional.
+   */
+  private teardownMqttClient(): void {
+    if (!this.mqttClient) return;
+    this.mqttClient.removeAllListeners();
+    this.mqttClient.end(true);
+    this.mqttClient = null;
+  }
+
   private connectMqtt(): void {
-    if (this.mqttClient) {
-      this.mqttClient.end(true);
-    }
+    this.teardownMqttClient();
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -2154,10 +2220,7 @@ class RiviumSync {
       this.reconnectTimer = null;
     }
 
-    if (this.mqttClient) {
-      this.mqttClient.end(true);
-      this.mqttClient = null;
-    }
+    this.teardownMqttClient();
 
     this.setConnectionState('disconnected');
   }
@@ -2187,38 +2250,49 @@ class RiviumSync {
     if (!this.mqttClient || !this.mqttClient.connected) return;
 
     // Resubscribe to document listeners
-    // Topic format: rivium_sync/{databaseId}/{collectionId}/{documentId}
+    // Topic format: rivium_sync/{projectId}/{databaseName}/{collectionName}/{documentId}
     this.documentListeners.forEach((_, path) => {
       const parts = path.split('/').filter((p) => p);
       if (parts.length === 3) {
         const [databaseId, collectionId, documentId] = parts;
-        const topic = `rivium_sync/${databaseId}/${collectionId}/${documentId}`;
+        const topic = this.topicFor(databaseId, collectionId, documentId);
         this.mqttClient!.subscribe(topic, { qos: RiviumSync.DEFAULT_QOS });
       }
     });
 
     // Resubscribe to collection listeners
-    // Topic format: rivium_sync/{databaseId}/{collectionId}/+ (wildcard for all documents)
+    // Topic format: .../{collectionName}/+ (wildcard for all documents)
     this.collectionListeners.forEach((_, path) => {
       const parts = path.split('/').filter((p) => p);
       if (parts.length === 2) {
         const [databaseId, collectionId] = parts;
-        const topic = `rivium_sync/${databaseId}/${collectionId}/+`;
+        const topic = this.topicFor(databaseId, collectionId, '+');
         this.mqttClient!.subscribe(topic, { qos: RiviumSync.DEFAULT_QOS });
       }
     });
   }
 
+  /**
+   * Topic for a collection or a single document.
+   *
+   * `rivium_sync/{projectId}/{databaseName}/{collectionName}[/{documentId}]` -
+   * the names the caller passed, under the project id the server gave us.
+   */
+  private topicFor(databaseId: string, collectionId: string, documentId?: string): string {
+    const base = `rivium_sync/${this.projectId ?? 'unknown'}/${databaseId}/${collectionId}`;
+    return documentId === undefined ? base : `${base}/${documentId}`;
+  }
+
   private handleMqttMessage(topic: string, data: any): void {
     this.log(RiviumSyncLogLevel.VERBOSE, 'MQTT message received:', topic, data);
 
-    // Parse topic: rivium_sync/{databaseId}/{collectionId}/{documentId}
+    // Parse topic: rivium_sync/{projectId}/{databaseName}/{collectionName}/{documentId}
     const parts = topic.split('/');
-    if (parts.length < 4) return;
+    if (parts.length < 5) return;
 
-    const databaseId = parts[1];
-    const collectionId = parts[2];
-    const documentId = parts[3];
+    const databaseId = parts[2];
+    const collectionId = parts[3];
+    const documentId = parts[4];
 
     const documentPath = `/${databaseId}/${collectionId}/${documentId}`;
     const collectionPath = `/${databaseId}/${collectionId}`;
@@ -2437,11 +2511,9 @@ class RiviumSync {
 
   // Direct server operations (bypass offline queue)
   private async addDocumentToServer<T>(databaseId: string, collectionId: string, data: T): Promise<SyncDocument<T>> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk`, {
       method: 'POST',
-      headers,
       body: JSON.stringify({ data }),
     });
 
@@ -2453,11 +2525,9 @@ class RiviumSync {
   }
 
   private async setDocumentOnServer<T>(databaseId: string, collectionId: string, documentId: string, data: T): Promise<void> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
       method: 'PUT',
-      headers,
       body: JSON.stringify({ data }),
     });
 
@@ -2467,11 +2537,9 @@ class RiviumSync {
   }
 
   private async updateDocumentOnServer<T>(databaseId: string, collectionId: string, documentId: string, data: Partial<T>): Promise<void> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
       method: 'PATCH',
-      headers,
       body: JSON.stringify({ data }),
     });
 
@@ -2481,11 +2549,9 @@ class RiviumSync {
   }
 
   private async deleteDocumentOnServer(databaseId: string, collectionId: string, documentId: string): Promise<void> {
-    const headers = this.buildHeaders();
 
-    const response = await fetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
       method: 'DELETE',
-      headers,
     });
 
     if (!response.ok) {

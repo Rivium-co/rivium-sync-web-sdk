@@ -196,14 +196,15 @@ const unsubscribe = collection.onSnapshot((documents) => {
 unsubscribe();
 ```
 
-## Local Development
+## Running against your own API
 
-For local development, update `config.ts`:
+The SDK talks to the hosted API by default. If you run RiviumSync yourself,
+point the example at it in `config.ts`:
 
 ```typescript
 export const AppConfig = {
   // ...
-  baseUrl: 'http://localhost:3006',
+  baseUrl: 'https://your-sync-host',
 };
 ```
 
@@ -215,3 +216,31 @@ export const AppConfig = {
 ## License
 
 MIT
+
+## Verified user identity (signed tokens)
+
+Security Rules read `auth.uid`. A browser cannot decide that value: the API key
+it ships with is public, so anyone who opens devtools could claim to be any
+user. Only a server holding the project's **server secret** can mint a user
+token.
+
+This example therefore has a stand-in backend: `vite.config.ts` adds a
+`POST /api/sync-token` endpoint to the dev server, which calls the Sync API's
+`/users/token` with the server secret and returns a short-lived token for a demo
+user. `src/main.ts` passes that as the SDK's `tokenProvider`, and the SDK sends
+it on every request, refreshing it before it expires.
+
+To turn it on:
+
+1. Copy `.env.example` to `.env` and set `RIVIUM_SYNC_SERVER_SECRET` from
+   Rivium Console → your project → settings.
+2. `npm run dev`. The event log shows "Signed user token obtained" when it works,
+   and a clear message when the secret is missing.
+
+Without the secret the example still runs, but falls back to an unsigned
+client-chosen id - which is exactly what a project with **Require signed user
+tokens** turned on will refuse.
+
+In your own app, replace this dev endpoint with a real one behind your session
+check, passing the id of the user who is actually signed in. **Never ship the
+server secret in an app.**

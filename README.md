@@ -13,6 +13,7 @@ Official Web SDK for RiviumSync Realtime Database.
 - **Query support** - Filters, sorting, pagination
 - **Auto reconnection** - Exponential backoff
 - **TypeScript** - Full type definitions included
+- **Verified users** - Signed user tokens for Security Rules
 
 ## Installation
 
@@ -45,6 +46,31 @@ users.onSnapshot((docs) => {
   console.log('Users updated:', docs);
 });
 ```
+
+## Verified user identity
+
+Security Rules check `auth.uid`. Because the API key ships inside your app,
+the browser cannot be trusted to say who the user is - only your own server
+can. Have it mint a short-lived user token and give the SDK a `tokenProvider`:
+
+```typescript
+const riviumSync = new RiviumSync({
+  apiKey: 'your-api-key',
+  tokenProvider: async () => {
+    const res = await fetch('/api/sync-token', { method: 'POST' });
+    return (await res.json()).token;
+  },
+});
+```
+
+The SDK calls it when it needs a token and again before the old one expires.
+Your endpoint mints the token with your project's server secret, which must
+stay on your server and never ship in an app.
+
+If your project has **Require signed user tokens** turned on in the Console,
+a `tokenProvider` is required; without it, requests are refused.
+
+See `example/` for a working setup.
 
 ## Documentation
 

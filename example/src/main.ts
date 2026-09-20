@@ -5,7 +5,7 @@
 
 // Import SDK from local build
 // @ts-ignore - local import
-import RiviumSyncSDK from '../../../web/rivium-sync-web/dist/index.esm.js';
+import RiviumSyncSDK from '../../dist/index.esm.js';
 import { AppConfig } from './config';
 
 // Type definitions for the SDK
@@ -103,13 +103,48 @@ const documentsList = document.getElementById('documents-list') as HTMLDivElemen
 const eventLog = document.getElementById('event-log') as HTMLDivElement;
 const listenerStatus = document.getElementById('listener-status') as HTMLDivElement;
 
+/**
+ * Fetches a user token from our own backend - here, the dev-server endpoint in
+ * vite.config.ts.
+ *
+ * The SDK calls this when it needs a token: at first use, shortly before the
+ * current one expires, and again if the server says one expired. It never sees
+ * the server secret that minted it.
+ */
+async function fetchUserToken(): Promise<string> {
+  const response = await fetch('/api/sync-token', { method: 'POST' });
+  const body = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    // Most likely RIVIUM_SYNC_SERVER_SECRET is missing; see example/.env.example.
+    throw new Error(body.error || `Token endpoint returned ${response.status}`);
+  }
+  return body.token;
+}
+
 // Initialize the SDK
 async function initSDK(): Promise<void> {
   try {
+    // Prove the token endpoint works before handing it to the SDK, so a missing
+    // server secret shows up as one clear message instead of failing requests.
+    let signedIdentity = false;
+    try {
+      await fetchUserToken();
+      signedIdentity = true;
+      addEventLog('create', 'Signed user token obtained - auth.uid is verified');
+    } catch (error) {
+      addEventLog('delete', `No signed token (${(error as Error).message})`);
+    }
+
     // Instantiate RiviumSync SDK
     riviumSync = new RiviumSyncClass({
       apiKey: AppConfig.apiKey,
       offlineEnabled: true,
+      // With a tokenProvider, `auth.uid` in Security Rules is the user your
+      // backend named, and it cannot be forged. Without one the SDK falls back
+      // to a client-chosen id, which a project using `requireSignedTokens`
+      // rejects - so only pass the provider when we actually have one.
+      ...(signedIdentity ? { tokenProvider: fetchUserToken } : {}),
     });
 
     db = riviumSync.database(AppConfig.databaseId);
