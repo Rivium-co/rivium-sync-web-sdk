@@ -1,7 +1,7 @@
 {
   "name": "@rivium/sync-web",
-  "version": "0.2.0",
-  "description": "Web SDK for RiviumSync - Firebase Realtime Database alternative with MQTT sync",
+  "version": "0.2.1",
+  "description": "Web SDK for RiviumSync - realtime database with offline-first sync",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",
@@ -20,7 +20,6 @@
   "keywords": [
     "rivium_sync",
     "realtime-database",
-    "mqtt",
     "websocket",
     "firebase-alternative",
     "realtime-sync",

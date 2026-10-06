@@ -72,7 +72,7 @@ interface SyncDatabase {
 }
 
 interface RiviumSyncInstance {
-  database(id: string): SyncDatabase;
+  database(name: string): SyncDatabase;
   batch(): WriteBatch;
   goOffline(): void;
   goOnline(): void;
@@ -147,7 +147,7 @@ async function initSDK(): Promise<void> {
       ...(signedIdentity ? { tokenProvider: fetchUserToken } : {}),
     });
 
-    db = riviumSync.database(AppConfig.databaseId);
+    db = riviumSync.database(AppConfig.databaseName);
     collection = db.collection(AppConfig.todosCollection);
 
     console.log('RiviumSync SDK initialized');

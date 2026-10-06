@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- The SDK can be created before sign-in when user tokens are required:
+  realtime waits for a token and then connects (`isAwaitingUserToken`,
+  `onAwaitingUserToken`).
+- Added `setUserToken()` and `refreshUserToken()`. A token for a different
+  user reconnects as that user.
+- `tokenProvider` may return `null` when no one is signed in.
+
 ## 0.2.0
 
 - Added `tokenProvider` and `userToken` so Security Rules can trust `auth.uid`.

@@ -12,10 +12,10 @@ A comprehensive example app demonstrating all features of the RiviumSync Web SDK
 
 ## Setup
 
-1. **Get your API credentials** from the AuthLeap dashboard:
+1. **Get your API credentials** from Rivium Console:
    - Go to Projects > Your Project > API Keys
    - Copy your API Key
-   - Note your Database ID
+   - Note your database name (e.g. `my-app`) as shown in Rivium Console
 
 2. **Configure the app** by copying and editing the config file:
 
@@ -28,7 +28,7 @@ Then edit `src/config.ts` with your credentials:
 ```typescript
 export const AppConfig = {
   apiKey: 'your-api-key-here',
-  databaseId: 'your-database-id-here',
+  databaseName: 'my-app', // database NAME from Rivium Console, not its UUID
   baseUrl: 'https://sync.rivium.co',
   todosCollection: 'todos',
 };
@@ -105,7 +105,7 @@ const riviumSync = new RiviumSync({
   offlineEnabled: true,
 });
 
-const db = riviumSync.database('your-database-id');
+const db = riviumSync.database('my-app');
 const collection = db.collection('todos');
 ```
 
@@ -117,7 +117,7 @@ const collection = db.collection('todos');
     apiKey: 'your-api-key',
   });
 
-  const db = riviumSync.database('your-database-id');
+  const db = riviumSync.database('my-app');
   const collection = db.collection('todos');
 </script>
 ```

@@ -1,13 +1,12 @@
 /**
  * RiviumSync Web SDK
- * Firebase Realtime Database alternative with MQTT sync
+ * Realtime database with offline-first sync
  *
  * Features:
- * - Realtime data synchronization via MQTT over WebSocket
+ * - Realtime data synchronization over WebSocket
  * - Firebase-like API: database → collection → document
  * - Offline support with IndexedDB caching
  * - Query support with filters
- * - JWT authentication via AuthLeap
  * - Automatic reconnection with exponential backoff
  *
  * @packageDocumentation
@@ -170,12 +169,15 @@ export interface RiviumSyncConfig {
    * sends it on every request, refreshes it shortly before it expires, and
    * fetches a new one if the server says it expired. This is what makes
    * `auth.uid` in Security Rules trustworthy.
+   *
+   * Return `null` when no one is signed in, and call `refreshUserToken()` when
+   * the user signs in or out.
    */
-  tokenProvider?: () => string | Promise<string>;
+  tokenProvider?: () => string | null | Promise<string | null>;
   /** A user token you already hold. `tokenProvider` is preferred: a static
    *  token cannot be refreshed when it expires. */
   userToken?: string;
-  /** JWT token from AuthLeap for authentication */
+  /** Bearer token sent as the Authorization header, if your setup needs one */
   authToken?: string;
   /** Maximum reconnect attempts (default: 10) */
   maxReconnectAttempts?: number;
@@ -503,17 +505,22 @@ export class SyncDatabase {
   }
 
   /**
-   * Get the database ID
+   * The database name this reference was created with (as passed to
+   * `riviumSync.database(name)`).
    */
   get id(): string {
     return this.databaseId;
   }
 
   /**
-   * Get a collection reference
+   * Get a collection reference.
+   *
+   * @param collectionName The collection NAME as shown in Rivium Console
+   *   (e.g. `'todos'`), not its UUID. Realtime updates are published by name,
+   *   so `onSnapshot` listeners only receive changes when you pass the name.
    */
-  collection<T = Record<string, any>>(collectionId: string): SyncCollection<T> {
-    return new SyncCollection<T>(this.riviumSync, this.databaseId, collectionId);
+  collection<T = Record<string, any>>(collectionName: string): SyncCollection<T> {
+    return new SyncCollection<T>(this.riviumSync, this.databaseId, collectionName);
   }
 
   /**
@@ -923,16 +930,16 @@ class OfflineCache {
  *
  * @example
  * ```typescript
- * import RiviumSync from '@rivium/web';
+ * import RiviumSync from '@rivium/sync-web';
  *
  * const riviumSync = new RiviumSync({
  *   apiKey: 'your_api_key',
- *   authToken: 'jwt_from_authleap',
+ *   authToken: 'your_bearer_token',
  * });
  *
  * // Listen to collection
  * const unsubscribe = riviumSync
- *   .database('mydb')
+ *   .database('my-app')
  *   .collection('users')
  *   .onSnapshot((docs) => {
  *     console.log('Users:', docs);
@@ -940,13 +947,13 @@ class OfflineCache {
  *
  * // Add a document
  * await riviumSync
- *   .database('mydb')
+ *   .database('my-app')
  *   .collection('users')
  *   .add({ name: 'John', age: 30 });
  *
  * // Query documents
  * const adults = await riviumSync
- *   .database('mydb')
+ *   .database('my-app')
  *   .collection('users')
  *   .where('age', '>=', 18)
  *   .orderBy('name')
@@ -1090,11 +1097,20 @@ class RiviumSync {
   private userTokenExpiresAt = 0;
   private userTokenInFlight?: Promise<string | undefined>;
 
-  /** Seconds since the epoch at which this token expires, 0 if unreadable. */
-  private tokenExpiry(token: string): number {
+  // The project requires a signed user token and there is none yet (no one
+  // is signed in). Not a failure: realtime connects once a token is supplied.
+  private awaitingUserToken = false;
+  private awaitingUserTokenListeners: Set<() => void> = new Set();
+  /** The user the realtime connection was authorised as. */
+  private realtimeUser: string | null = null;
+  /** False after the app asked to disconnect, until it reconnects. */
+  private wantConnected = true;
+
+  /** The claims of a token, or null when they cannot be read. */
+  private tokenClaims(token: string): Record<string, unknown> | null {
     try {
       const [, payload] = token.split('.');
-      const json = JSON.parse(
+      return JSON.parse(
         decodeURIComponent(
           atob(payload.replace(/-/g, '+').replace(/_/g, '/'))
             .split('')
@@ -1102,10 +1118,22 @@ class RiviumSync {
             .join(''),
         ),
       );
-      return typeof json.exp === 'number' ? json.exp : 0;
     } catch {
-      return 0;
+      return null;
     }
+  }
+
+  /** Seconds since the epoch at which this token expires, 0 if unreadable. */
+  private tokenExpiry(token: string): number {
+    const exp = this.tokenClaims(token)?.exp;
+    return typeof exp === 'number' ? exp : 0;
+  }
+
+  /** The user a token is for (`sub`), or null without a token. */
+  private tokenUser(token: string | undefined): string | null {
+    if (!token) return null;
+    const sub = this.tokenClaims(token)?.sub;
+    return typeof sub === 'string' ? sub : null;
   }
 
   /**
@@ -1126,9 +1154,9 @@ class RiviumSync {
 
     this.userTokenInFlight = (async () => {
       try {
-        const token = await this.config.tokenProvider!();
+        const token = (await this.config.tokenProvider!()) ?? undefined;
         this.userToken = token;
-        this.userTokenExpiresAt = this.tokenExpiry(token);
+        this.userTokenExpiresAt = token ? this.tokenExpiry(token) : 0;
         return token;
       } catch (e) {
         this.log(RiviumSyncLogLevel.ERROR, 'tokenProvider failed:', e);
@@ -1228,11 +1256,31 @@ class RiviumSync {
         method: 'POST',
       });
 
+      if (response.status === 401) {
+        const body = await response.clone().json().catch(() => null);
+        if (body?.code === 'token_required') {
+          // No one is signed in yet. Wait for the app's token; this is not an
+          // error and retrying cannot help.
+          this.log(RiviumSyncLogLevel.INFO, 'This project requires a user token; realtime connects when one is set');
+          this.awaitingUserToken = true;
+          this.awaitingUserTokenListeners.forEach((listener) => {
+            try {
+              listener();
+            } catch (e) {
+              this.log(RiviumSyncLogLevel.ERROR, 'Awaiting-user-token listener threw:', e);
+            }
+          });
+          return;
+        }
+      }
+
       if (!response.ok) {
         throw new Error(`Token request failed: ${response.status}`);
       }
 
       const tokenData = await response.json();
+      this.awaitingUserToken = false;
+      this.realtimeUser = this.tokenUser(await this.ensureUserToken());
 
       // Topics are `rivium_sync/{projectId}/{databaseName}/{collectionName}/...`.
       // The names are the ones the app already uses; the project id comes from
@@ -1259,6 +1307,66 @@ class RiviumSync {
   }
 
   /**
+   * True while realtime is waiting for a user token: the project requires
+   * signed user tokens and none has been supplied yet. The SDK connects by
+   * itself after `setUserToken()` or `refreshUserToken()`.
+   */
+  get isAwaitingUserToken(): boolean {
+    return this.awaitingUserToken;
+  }
+
+  /** Called when realtime starts waiting for a user token. */
+  onAwaitingUserToken(callback: () => void): Unsubscribe {
+    this.awaitingUserTokenListeners.add(callback);
+    return () => this.awaitingUserTokenListeners.delete(callback);
+  }
+
+  /**
+   * Replace the user token, or pass `null` when the user signs out. Realtime
+   * connects if it was waiting for a token, and reconnects if the token is for
+   * a different user.
+   */
+  async setUserToken(token: string | null): Promise<void> {
+    if (this.config.tokenProvider) {
+      this.userToken = token ?? undefined;
+      this.userTokenExpiresAt = token ? this.tokenExpiry(token) : 0;
+    } else {
+      this.config.userToken = token ?? undefined;
+    }
+    await this.userMayHaveChanged();
+  }
+
+  /**
+   * Ask `tokenProvider` again. Call this when the user signs in or out; the
+   * SDK then connects, or reconnects, as that user.
+   */
+  async refreshUserToken(): Promise<void> {
+    this.invalidateUserToken();
+    await this.userMayHaveChanged();
+  }
+
+  private async userMayHaveChanged(): Promise<void> {
+    const token = await this.ensureUserToken();
+    const user = this.tokenUser(token);
+
+    if (this.awaitingUserToken) {
+      if (!token || !this.wantConnected) return;
+      this.awaitingUserToken = false;
+      await this.fetchMqttConfig();
+      return;
+    }
+
+    if (!this.mqttConfigFetched || user === this.realtimeUser) return;
+
+    // The open connection belongs to the previous user. Listeners stay
+    // registered and are subscribed again on the new connection.
+    this.log(RiviumSyncLogLevel.INFO, 'Signed-in user changed; reconnecting');
+    this.disconnectMqtt();
+    this.mqttConfigFetched = false;
+    if (this.wantConnected) await this.fetchMqttConfig();
+  }
+
+  /**
    * Update auth token
    */
   setAuthToken(token: string): void {
@@ -1277,10 +1385,19 @@ class RiviumSync {
   // ==========================================================================
 
   /**
-   * Get a database reference
+   * Get a database reference.
+   *
+   * @param databaseName The database NAME as shown in Rivium Console
+   *   (e.g. `'my-app'`), not its UUID. Realtime updates are published by name,
+   *   so `onSnapshot` listeners only receive changes when you pass the name.
+   *
+   * @example
+   * ```typescript
+   * const todos = riviumSync.database('my-app').collection('todos');
+   * ```
    */
-  database(databaseId: string): SyncDatabase {
-    return new SyncDatabase(this, databaseId);
+  database(databaseName: string): SyncDatabase {
+    return new SyncDatabase(this, databaseName);
   }
 
   /**
@@ -1320,6 +1437,9 @@ class RiviumSync {
 
   /**
    * Delete a database
+   *
+   * @param databaseId The database's id (UUID) from `createDatabase()` or
+   *   Rivium Console - unlike `database()`, this call does not accept a name.
    */
   async deleteDatabase(databaseId: string): Promise<void> {
 
@@ -1334,10 +1454,12 @@ class RiviumSync {
 
   /**
    * List all collections in a database
+   *
+   * @param databaseName The database name as shown in Rivium Console.
    */
-  async listCollections(databaseId: string): Promise<CollectionInfo[]> {
+  async listCollections(databaseName: string): Promise<CollectionInfo[]> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseName}/collections`, {
       method: 'GET',
     });
 
@@ -1351,10 +1473,13 @@ class RiviumSync {
 
   /**
    * Create a new collection in a database
+   *
+   * @param databaseName The database name as shown in Rivium Console.
+   * @param name The new collection's name.
    */
-  async createCollection(databaseId: string, name: string): Promise<CollectionInfo> {
+  async createCollection(databaseName: string, name: string): Promise<CollectionInfo> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections`, {
+    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseName}/collections`, {
       method: 'POST',
       body: JSON.stringify({ name }),
     });
@@ -1534,6 +1659,8 @@ class RiviumSync {
    * Disconnect from server
    */
   disconnect(): void {
+    this.wantConnected = false;
+    this.awaitingUserToken = false;
     this.disconnectMqtt();
   }
 
@@ -1541,6 +1668,7 @@ class RiviumSync {
    * Reconnect to server
    */
   reconnect(): void {
+    this.wantConnected = true;
     if (this.mqttConfigFetched) {
       this.connectMqtt();
     } else {
@@ -1559,7 +1687,7 @@ class RiviumSync {
    * Manually go offline (disconnect from server)
    */
   goOffline(): void {
-    this.disconnectMqtt();
+    this.disconnect();
   }
 
   /**
