@@ -10,8 +10,11 @@
     "dist"
   ],
   "scripts": {
+    "prebuild": "node scripts/gen-version.mjs",
     "build": "rollup -c",
+    "predev": "node scripts/gen-version.mjs",
     "dev": "rollup -c -w",
+    "pretest": "node scripts/gen-version.mjs",
     "test": "jest --passWithNoTests",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",

@@ -13,6 +13,7 @@
  */
 
 import mqtt, { MqttClient, IClientOptions } from 'mqtt';
+import { SDK_HEADER, SDK_HEADER_VALUE } from './version';
 
 // ============================================================================
 // Error Codes
@@ -1188,6 +1189,7 @@ class RiviumSync {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'x-api-key': this.config.apiKey,
+      [SDK_HEADER]: SDK_HEADER_VALUE,
     };
 
     const token = await this.ensureUserToken();
@@ -2743,3 +2745,4 @@ class RiviumSync {
 
 export default RiviumSync;
 export { RiviumSync };
+export { SDK_NAME, SDK_VERSION } from './version';
