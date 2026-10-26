@@ -19,6 +19,7 @@
         <button class="tab" data-tab="batch">Batch Operations</button>
         <button class="tab" data-tab="realtime">Realtime</button>
         <button class="tab" data-tab="offline">Offline</button>
+        <button class="tab" data-tab="rules">Rules</button>
       </nav>
 
       <!-- CRUD Tab -->
@@ -199,6 +200,40 @@
           <h2>Offline Log</h2>
           <div id="offline-log" class="event-log">
             <p class="empty-state">Offline events will appear here</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Rules Tab -->
+      <section id="rules-tab" class="tab-content">
+        <div class="card">
+          <div class="card-header">
+            <h2>Security Rules checks</h2>
+            <div>Signed in as <strong id="rules-user">-</strong></div>
+          </div>
+          <p class="hint">
+            For the default "owner only" rules: a document's <code>userId</code> must be the signed-in user. Each
+            check prints PASS or FAIL.
+          </p>
+          <div class="button-group">
+            <button id="rules-1" class="btn btn-secondary">1. Write with another user's id &rarr; 403, not queued</button>
+            <button id="rules-2" class="btn btn-secondary">2. List with no filter &rarr; query_not_allowed</button>
+            <button id="rules-3" class="btn btn-secondary">3. Another user's todos &rarr; refused</button>
+            <button id="rules-4" class="btn btn-secondary">4. Typed equality: "false" is not false</button>
+            <button id="rules-5" class="btn btn-secondary">5. set replaces, set merge keeps</button>
+            <button id="rules-6" class="btn btn-secondary">6. Listen to one document</button>
+            <button id="rules-7" class="btn btn-secondary">7. Batch is all or nothing</button>
+            <button id="rules-8" class="btn btn-secondary">8. Offline write the rules refuse is rolled back</button>
+            <button id="rules-9" class="btn btn-secondary">9. Listen to my todos (then change rules in Console)</button>
+            <button id="rules-switch-user" class="btn btn-primary">Switch user</button>
+            <button id="rules-clear" class="btn btn-secondary">Clear log</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Rules Log</h2>
+          <div id="rules-log" class="event-log">
+            <p class="empty-state">Results will appear here</p>
           </div>
         </div>
       </section>

@@ -15,11 +15,8 @@ export const AppConfig = {
   // when you use the name.
   databaseName: 'my-app',
 
-  // API base URL (production)
-  baseUrl: 'https://sync.rivium.co',
-
-  // For local development, use this instead:
-  // baseUrl: 'http://localhost:3006',
+  // To use a Rivium Sync server on this machine instead, see .env.example
+  // (npm run dev:emulator).
 
   // Demo collection name
   todosCollection: 'todos',

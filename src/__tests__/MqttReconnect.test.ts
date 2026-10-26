@@ -16,6 +16,7 @@ const clients: FakeClient[] = [];
 
 class FakeClient extends EventEmitter {
   connected = false;
+  options: any = {};
   ended = false;
   subscribed: string[] = [];
 
@@ -32,14 +33,16 @@ class FakeClient extends EventEmitter {
 jest.mock('mqtt', () => ({
   __esModule: true,
   default: {
-    connect: () => {
+    connect: (_url: string, options: any) => {
       const c = new FakeClient();
+      c.options = options;
       clients.push(c);
       return c;
     },
   },
-  connect: () => {
+  connect: (_url: string, options: any) => {
     const c = new FakeClient();
+    c.options = options;
     clients.push(c);
     return c;
   },
@@ -122,5 +125,28 @@ describe('MQTT connection churn', () => {
     await flush();
 
     expect(clients.length).toBe(before + 1);
+  });
+
+  // The broker checks the token only at login: a reconnect with the first one was refused for good once it
+  // expired (found 2026-10-26 on the native SDKs, same design here).
+  it('a reconnect logs in with a fresh token, not the first one', async () => {
+    let issued = 0;
+    (globalThis.fetch as jest.Mock).mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: `mqtt-token-${++issued}`, projectId: 'proj-1' }),
+      clone() { return this as any; },
+    }));
+    await connected();
+    const first = clients[clients.length - 1];
+    expect(first.options.password).toBe('mqtt-token-1');
+
+    first.emit('close');
+    jest.advanceTimersByTime(60_000);
+    await flush();
+
+    const again = clients[clients.length - 1];
+    expect(again).not.toBe(first);
+    expect(again.options.password).toBe('mqtt-token-2');
   });
 });

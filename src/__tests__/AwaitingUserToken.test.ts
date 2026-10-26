@@ -131,10 +131,35 @@ describe('waiting for a user token', () => {
   });
 
   it('reconnects as the new user and keeps listeners', async () => {
+    // The listen route answers a private topic per request.
+    let n = 0;
+    fetchMock.mockImplementation(async (url: string, init: any) => {
+      if (String(url).endsWith('/listen') && init?.headers?.['X-User-Token']) {
+        n++;
+        const res: any = {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            subscriptionId: `sub-${n}`,
+            topic: `rivium_sync/proj-1/s/sub-${n}`,
+            expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+            documents: [],
+          }),
+        };
+        res.clone = () => res;
+        return res;
+      }
+      return init?.headers?.['X-User-Token'] ? granted() : tokenRequired();
+    });
+
     const sync = new RiviumSync({ apiKey: 'rv_live_x', offlineEnabled: false, userToken: tokenFor('user-1') });
     await flush();
     expect(clients).toHaveLength(1);
     sync.database('my-app').collection('todos').onSnapshot(() => {});
+    clients[0].connected = true;
+    clients[0].emit('connect');
+    await flush();
+    expect(clients[0].subscribed).toContain('rivium_sync/proj-1/s/sub-1');
 
     await sync.setUserToken(tokenFor('user-2'));
     await flush();
@@ -143,9 +168,12 @@ describe('waiting for a user token', () => {
     expect(clients[0].ended).toBe(true);
     expect(realtimeRequests()).toBe(2);
 
+    // On the new connection the listener is started again as the new user.
     clients[1].connected = true;
     clients[1].emit('connect');
-    expect(clients[1].subscribed).toContain('rivium_sync/proj-1/my-app/todos/+');
+    await flush();
+    expect(clients[1].subscribed).toContain('rivium_sync/proj-1/s/sub-2');
+    expect(clients[1].subscribed).not.toContain('rivium_sync/proj-1/s/sub-1');
   });
 
   it('does not reconnect for a renewed token of the same user', async () => {

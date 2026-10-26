@@ -1,6 +1,9 @@
 /**
  * RiviumSync Web SDK Example App
- * Demonstrates CRUD, Queries, Batch Operations, and Realtime Sync
+ * Demonstrates CRUD, Queries, Batch Operations, Realtime Sync and Security Rules
+ *
+ * Works with the default "owner only" rules: every document carries `userId`
+ * (the signed-in user), and every list and listener asks for `userId == me`.
  */
 
 // Import SDK from local build
@@ -31,10 +34,18 @@ interface QueryOptions {
   offset?: number;
 }
 
+interface SyncError extends Error {
+  code: number;
+  reason?: string;
+  fields?: string[];
+  statusCode?: number;
+}
+
 interface SyncDocumentRef {
   id: string;
   get(): Promise<SyncDocument | null>;
-  set(data: Record<string, unknown>): Promise<void>;
+  set(data: Record<string, unknown>, options?: { merge?: boolean }): Promise<void>;
+  onSnapshot(callback: (doc: SyncDocument | null) => void, onError?: (error: SyncError) => void): () => void;
   update(data: Record<string, unknown>): Promise<void>;
   delete(): Promise<void>;
 }
@@ -44,7 +55,7 @@ interface SyncCollection {
   add(data: Record<string, unknown>): Promise<SyncDocument>;
   get(options?: QueryOptions): Promise<SyncDocument[]>;
   document(documentId: string): SyncDocumentRef;
-  onSnapshot(callback: (docs: SyncDocument[]) => void): () => void;
+  onSnapshot(callback: (docs: SyncDocument[]) => void, options?: QueryOptions, onError?: (error: SyncError) => void): () => void;
   where(field: string, operator: string, value: unknown): SyncQuery;
   orderBy(field: string, direction?: 'asc' | 'desc'): SyncQuery;
   limit(count: number): SyncQuery;
@@ -55,6 +66,7 @@ interface SyncQuery {
   orderBy(field: string, direction?: 'asc' | 'desc'): SyncQuery;
   limit(count: number): SyncQuery;
   get(): Promise<SyncDocument[]>;
+  onSnapshot(callback: (docs: SyncDocument[]) => void, onError?: (error: SyncError) => void): () => void;
 }
 
 interface WriteBatch {
@@ -80,13 +92,35 @@ interface RiviumSyncInstance {
   getPendingWritesCount(): number;
   forceSyncPendingWrites(): Promise<void>;
   clearCache(): Promise<void>;
+  disconnect(): void;
+  reconnect(): void;
+  refreshUserToken(): Promise<void>;
+  onDocumentRejected(callback: (documentId: string, operation: string, error: SyncError) => void): () => void;
 }
 
 interface RiviumSyncConstructor {
-  new (config: { apiKey: string; serverUrl?: string; offlineEnabled?: boolean; debugMode?: boolean; logLevel?: number }): RiviumSyncInstance;
+  new (config: {
+    apiKey: string;
+    offlineEnabled?: boolean;
+    logLevel?: number;
+    tokenProvider?: () => Promise<string | null>;
+    useEmulator?: { host: string; port?: number };
+  }): RiviumSyncInstance;
 }
 
 const RiviumSyncClass = RiviumSyncSDK as RiviumSyncConstructor;
+
+// Local values from the gitignored .env files (see vite.config.ts); they win over config.ts.
+declare const __LOCAL_SETTINGS__: { apiKey?: string; databaseName?: string; emulatorHost?: string; emulatorPort?: number; demoUserId: string };
+const settings = { ...AppConfig, ...__LOCAL_SETTINGS__ };
+
+// The signed-in demo user, and the other one ("Switch user"). A real app has its own login.
+let currentUser = settings.demoUserId;
+const otherUser = (): string => (currentUser === settings.demoUserId ? `${settings.demoUserId}-2` : settings.demoUserId);
+
+/** My todos: the owner-only rules allow a list only when it asks for `userId == me`. */
+const mine = (): SyncQuery => collection.where('userId', '==', currentUser);
+const mineFilter = (): QueryFilter => ({ field: 'userId', operator: '==', value: currentUser });
 
 // Global state
 let riviumSync: RiviumSyncInstance;
@@ -112,7 +146,11 @@ const listenerStatus = document.getElementById('listener-status') as HTMLDivElem
  * the server secret that minted it.
  */
 async function fetchUserToken(): Promise<string> {
-  const response = await fetch('/api/sync-token', { method: 'POST' });
+  const response = await fetch('/api/sync-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userId: currentUser }),
+  });
   const body = await response.json().catch(() => ({}));
 
   if (!response.ok) {
@@ -138,8 +176,10 @@ async function initSDK(): Promise<void> {
 
     // Instantiate RiviumSync SDK
     riviumSync = new RiviumSyncClass({
-      apiKey: AppConfig.apiKey,
+      apiKey: settings.apiKey,
       offlineEnabled: true,
+      // A Rivium Sync server on this machine (RIVIUM_SYNC_EMULATOR_HOST in .env.emulator).
+      ...(settings.emulatorHost ? { useEmulator: { host: settings.emulatorHost, port: settings.emulatorPort } } : {}),
       // With a tokenProvider, `auth.uid` in Security Rules is the user your
       // backend named, and it cannot be forged. Without one the SDK falls back
       // to a client-chosen id, which a project using `requireSignedTokens`
@@ -147,8 +187,17 @@ async function initSDK(): Promise<void> {
       ...(signedIdentity ? { tokenProvider: fetchUserToken } : {}),
     });
 
-    db = riviumSync.database(AppConfig.databaseName);
-    collection = db.collection(AppConfig.todosCollection);
+    db = riviumSync.database(settings.databaseName);
+    collection = db.collection(settings.todosCollection);
+
+    // A write made offline that the server refuses later is rolled back; this says so.
+    riviumSync.onDocumentRejected((documentId, operation, error) => {
+      addRulesLog(`Sync: server refused queued ${operation} of ${documentId}: ${error.message}`);
+      onRejected?.(documentId);
+      addOfflineLog('delete', `Refused by the server, rolled back: ${operation} ${documentId}`);
+      loadDocuments();
+    });
+    showUser();
 
     console.log('RiviumSync SDK initialized');
     await loadDocuments();
@@ -162,7 +211,7 @@ async function initSDK(): Promise<void> {
 async function loadDocuments(): Promise<void> {
   try {
     documentsList.innerHTML = '<p class="empty-state">Loading...</p>';
-    documents = await collection.get();
+    documents = await mine().get();
     renderDocuments();
     crudResult.textContent = `Loaded ${documents.length} documents`;
   } catch (error) {
@@ -214,6 +263,7 @@ async function createDocument(title: string, description: string): Promise<void>
     const doc = await collection.add({
       title,
       description,
+      userId: currentUser,
       completed: false,
       createdAt: new Date().toISOString(),
     });
@@ -341,7 +391,8 @@ async function runQuery(): Promise<void> {
   else if (!isNaN(Number(valueStr))) value = Number(valueStr);
 
   try {
-    const filters: QueryFilter[] = field ? [{ field, operator: operator as QueryFilter['operator'], value }] : [];
+    // Always `userId == me` first: the rules allow nothing wider.
+    const filters: QueryFilter[] = [mineFilter(), ...(field ? [{ field, operator: operator as QueryFilter['operator'], value }] : [])];
 
     // Use collection.get() with QueryOptions
     const results = await collection.get({
@@ -371,9 +422,9 @@ async function batchCreate(): Promise<void> {
     const batch = riviumSync.batch();
     const now = new Date().toISOString();
 
-    batch.create(collection, { title: 'Batch Task 1', completed: false, createdAt: now });
-    batch.create(collection, { title: 'Batch Task 2', completed: false, createdAt: now });
-    batch.create(collection, { title: 'Batch Task 3', completed: false, createdAt: now });
+    batch.create(collection, { title: 'Batch Task 1', userId: currentUser, completed: false, createdAt: now });
+    batch.create(collection, { title: 'Batch Task 2', userId: currentUser, completed: false, createdAt: now });
+    batch.create(collection, { title: 'Batch Task 3', userId: currentUser, completed: false, createdAt: now });
 
     await batch.commit();
 
@@ -476,7 +527,7 @@ async function batchMixed(): Promise<void> {
     const now = new Date().toISOString();
 
     // Create one
-    batch.create(collection, { title: 'Mixed: New Task', completed: false, createdAt: now });
+    batch.create(collection, { title: 'Mixed: New Task', userId: currentUser, completed: false, createdAt: now });
 
     // Update first if exists
     if (documents.length > 0) {
@@ -552,6 +603,8 @@ function startListener(): void {
     documents = docs;
     renderDocuments();
     addEventLog('info', `Collection updated: ${docs.length} documents`);
+  }, { filters: [mineFilter()] }, (error: SyncError) => {
+    addEventLog('delete', `Listener stopped: ${error.message}`);
   });
 
   // Update UI
@@ -579,6 +632,7 @@ async function realtimeCreate(): Promise<void> {
   try {
     await collection.add({
       title: `Realtime Test ${Date.now()}`,
+      userId: currentUser,
       completed: false,
       createdAt: new Date().toISOString(),
     });
@@ -739,6 +793,7 @@ async function offlineCreate(): Promise<void> {
     const doc = await collection.add({
       title: `Offline Task ${Date.now()}`,
       description: 'Created while potentially offline',
+      userId: currentUser,
       completed: false,
       createdAt: new Date().toISOString(),
     });
@@ -769,6 +824,192 @@ async function offlineUpdate(): Promise<void> {
   } catch (error) {
     addOfflineLog('info', `Queued for sync: ${error}`);
   }
+}
+
+// Security Rules checks
+//
+// For the default "owner only" rules (a document's `userId` must be the
+// signed-in user): what the server refuses, and that the SDK reports it
+// instead of hiding it in the offline cache. Each check prints PASS or FAIL.
+
+const rulesLog = document.getElementById('rules-log') as HTMLDivElement;
+const rulesUser = document.getElementById('rules-user') as HTMLSpanElement;
+let rulesDocListener: (() => void) | null = null;
+let rulesQueryListener: (() => void) | null = null;
+let onRejected: ((documentId: string) => void) | null = null;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const profileRef = (): SyncDocumentRef => collection.document(`profile_${currentUser}`);
+const errorOf = (promise: Promise<unknown>): Promise<SyncError | null> => promise.then(() => null, (e: SyncError) => e);
+
+function addRulesLog(message: string): void {
+  if (!rulesLog) return;
+  const empty = rulesLog.querySelector('.empty-state');
+  if (empty) empty.remove();
+  const line = document.createElement('div');
+  line.className = `event-item ${message.startsWith('PASS') ? 'create' : message.startsWith('FAIL') ? 'delete' : 'info'}`;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+  rulesLog.insertBefore(line, rulesLog.firstChild);
+}
+
+function expect(passed: boolean, expected: string, got: string): void {
+  addRulesLog(passed ? `PASS: ${expected}` : `FAIL: expected ${expected}; got ${got}`);
+}
+
+function showUser(): void {
+  if (rulesUser) rulesUser.textContent = currentUser;
+}
+
+async function runCheck(label: string, check: () => Promise<void> | void): Promise<void> {
+  addRulesLog(`- ${label}`);
+  try {
+    await check();
+  } catch (error) {
+    addRulesLog(`FAIL: unexpected ${(error as Error).message}`);
+  }
+}
+
+/** 1. A write with another user's id: the server's 403 is thrown, nothing is queued. */
+async function checkRefusedWrite(): Promise<void> {
+  const before = riviumSync.getPendingWritesCount();
+  const error = await errorOf(collection.add({ title: 'Not mine', userId: otherUser() }));
+  await sleep(100);
+  const queued = riviumSync.getPendingWritesCount() - before;
+  expect(error?.statusCode === 403 && queued === 0, '403 and nothing queued', `status=${error?.statusCode}, queued ${queued}, ${error?.message}`);
+}
+
+/** 2. A list with no filter could return other users' todos: query_not_allowed, not the cache. */
+async function checkRefusedList(): Promise<void> {
+  const error = await errorOf(collection.get());
+  expect(
+    error?.reason === 'query_not_allowed' && !!error.fields?.includes('userId'),
+    'query_not_allowed naming userId (not the cache)',
+    error ? `${error.reason}: ${error.message}` : 'no error: the list came back',
+  );
+}
+
+/** 3. Another user's todos are refused. */
+async function checkOtherUsersTodos(): Promise<void> {
+  const error = await errorOf(collection.where('userId', '==', otherUser()).get());
+  expect(error?.statusCode === 403, 'refused (403)', error ? `${error.statusCode} ${error.message}` : "no error: another user's todos came back");
+}
+
+/** 4. Filters keep their JSON type: the string "false" is not the boolean false. */
+async function checkTypedEquality(): Promise<void> {
+  await collection.add({ title: 'Typed', userId: currentUser, completed: false });
+  const asText = (await mine().where('completed', '==', 'false').get()).length;
+  const asBoolean = (await mine().where('completed', '==', false).get()).length;
+  expect(asText === 0 && asBoolean >= 1, '"false" finds 0, false finds 1+', `"false" found ${asText}, false found ${asBoolean}`);
+}
+
+/** 5. set() replaces the document; set(..., { merge: true }) keeps the other fields. */
+async function checkSetAndMerge(): Promise<void> {
+  const ref = profileRef();
+  await ref.set({ userId: currentUser, a: 1, b: 2 });
+  await ref.set({ userId: currentUser, a: 9 });
+  const replaced = (await ref.get())?.data;
+  await ref.set({ c: 3 }, { merge: true });
+  const merged = (await ref.get())?.data;
+  addRulesLog(`after set: ${JSON.stringify(replaced)}; after merge: ${JSON.stringify(merged)}`);
+  expect(
+    !!replaced && !('b' in replaced) && merged?.a === 9 && merged?.c === 3 && merged?.userId === currentUser,
+    'set drops b; merge keeps a + userId and adds c',
+    `set=${JSON.stringify(replaced)}, merge=${JSON.stringify(merged)}`,
+  );
+}
+
+/** 6. A listener on one document hears its change. */
+async function checkListenDocument(): Promise<void> {
+  rulesDocListener?.();
+  const ref = profileRef();
+  const tick = Date.now();
+  await ref.set({ userId: currentUser }, { merge: true });
+  const heard = new Promise<boolean>((resolve) => {
+    rulesDocListener = ref.onSnapshot(
+      (doc) => {
+        addRulesLog(`document listener: ${JSON.stringify(doc?.data)}`);
+        if (doc?.data?.tick === tick) resolve(true);
+      },
+      (error) => addRulesLog(`document listener stopped: ${error.message}`),
+    );
+  });
+  await ref.set({ tick }, { merge: true });
+  expect(await Promise.race([heard, sleep(10_000).then(() => false)]), `the listener hears tick=${tick}`, 'nothing heard in 10 s');
+}
+
+/** 7. A batch with one refused write saves nothing. */
+async function checkBatchAllOrNothing(): Promise<void> {
+  const before = (await mine().get()).length;
+  const error = await errorOf(
+    riviumSync
+      .batch()
+      .create(collection, { title: 'Batch ok', userId: currentUser })
+      .create(collection, { title: 'Batch not mine', userId: otherUser() })
+      .commit(),
+  );
+  const after = (await mine().get()).length;
+  expect(!!error && after === before, 'refused, and the allowed create is not saved either', `error=${error?.message}, my todos ${before} -> ${after}`);
+}
+
+/** 8. A write made offline that the rules refuse is rolled back when it is sent. */
+async function checkOfflineRefusedWrite(): Promise<void> {
+  const rejected = new Promise<string>((resolve) => (onRejected = resolve));
+  riviumSync.disconnect();
+  const queued = await collection.add({ title: 'Queued, not mine', userId: otherUser() });
+  addRulesLog(`Offline: queued ${queued.id}; reconnecting`);
+  riviumSync.reconnect();
+  void riviumSync.forceSyncPendingWrites();
+  const id = await Promise.race([rejected, sleep(15_000).then(() => null)]);
+  onRejected = null;
+  await sleep(100);
+  const pending = riviumSync.getPendingWritesCount();
+  expect(id === queued.id && pending === 0, 'rejected and removed from the queue', `rejected=${id}, still pending=${pending}`);
+}
+
+/** 9. Listen to my todos; changing the rules in the Console stops it with listener_revoked. */
+function checkListenMine(): void {
+  rulesQueryListener?.();
+  rulesQueryListener = mine().onSnapshot(
+    (docs) => addRulesLog(`listener: ${docs.length} todos`),
+    (error) => addRulesLog(`listener stopped: ${error.reason ?? ''} ${error.message}`),
+  );
+  addRulesLog(
+    'Listening. In the Console, publish rules that deny reading todos: expect "listener stopped: listener_revoked". Publish the old rules again after.',
+  );
+}
+
+/** Sign in as the other demo user: the SDK asks the token endpoint again and reconnects as that user. */
+async function switchUser(): Promise<void> {
+  currentUser = otherUser();
+  await riviumSync.refreshUserToken();
+  showUser();
+  addRulesLog(`Signed in as ${currentUser} (checks 1-3 now use the other user)`);
+  if (unsubscribe) {
+    stopListener();
+    startListener();
+  }
+  await loadDocuments();
+}
+
+function setupRulesChecks(): void {
+  const checks: [string, string, () => Promise<void> | void][] = [
+    ['rules-1', "1. Write with another user's id -> 403, not queued", checkRefusedWrite],
+    ['rules-2', '2. List with no filter -> query_not_allowed', checkRefusedList],
+    ['rules-3', "3. Another user's todos -> refused", checkOtherUsersTodos],
+    ['rules-4', '4. Typed equality: "false" is not false', checkTypedEquality],
+    ['rules-5', '5. set replaces, set merge keeps', checkSetAndMerge],
+    ['rules-6', '6. Listen to one document', checkListenDocument],
+    ['rules-7', '7. Batch is all or nothing', checkBatchAllOrNothing],
+    ['rules-8', '8. Offline write the rules refuse is rolled back', checkOfflineRefusedWrite],
+    ['rules-9', '9. Listen to my todos (then change rules in Console)', checkListenMine],
+  ];
+  for (const [id, label, check] of checks) {
+    document.getElementById(id)?.addEventListener('click', () => runCheck(label, check));
+  }
+  document.getElementById('rules-switch-user')?.addEventListener('click', () => runCheck('Switch user', switchUser));
+  document.getElementById('rules-clear')?.addEventListener('click', () => {
+    rulesLog.innerHTML = '';
+  });
 }
 
 // Tab Navigation
@@ -834,5 +1075,6 @@ document.addEventListener('DOMContentLoaded', () => {
   setupTabs();
   setupEventListeners();
   setupOfflineListeners();
+  setupRulesChecks();
   initSDK();
 });

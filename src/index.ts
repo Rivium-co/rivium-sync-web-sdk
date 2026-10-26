@@ -14,6 +14,7 @@
 
 import mqtt, { MqttClient, IClientOptions } from 'mqtt';
 import { SDK_HEADER, SDK_HEADER_VALUE } from './version';
+import { ListenerState, ListenerEvent, KeptDocument, deliveryKey } from './listener-state';
 
 // ============================================================================
 // Error Codes
@@ -36,6 +37,10 @@ export enum RiviumSyncErrorCode {
   SUBSCRIPTION_FAILED = 1100,
   UNSUBSCRIPTION_FAILED = 1101,
   INVALID_PATH = 1102,
+  /** The server ended a listener because the security rules no longer allow it. */
+  LISTENER_REVOKED = 1103,
+  /** Too many listeners on one connection. */
+  TOO_MANY_LISTENERS = 1104,
 
   // Data errors (1200-1299)
   DATA_FETCH_FAILED = 1200,
@@ -55,9 +60,18 @@ export enum RiviumSyncErrorCode {
   NOT_CONNECTED = 1501,
   ALREADY_CONNECTED = 1502,
 
+  // Permission errors (1600-1699)
+  /** The security rules refused the request. */
+  PERMISSION_DENIED = 1600,
+
   // Query errors (1700-1799)
   INVALID_QUERY = 1700,
   QUERY_EXECUTION_FAILED = 1701,
+  /**
+   * The security rules cannot allow this query for every document it could
+   * return (rules are not filters). `fields` names the filters to add.
+   */
+  QUERY_NOT_ALLOWED = 1702,
 
   // Unknown error
   UNKNOWN_ERROR = 9999,
@@ -77,6 +91,9 @@ const ERROR_MESSAGES: Record<RiviumSyncErrorCode, string> = {
   [RiviumSyncErrorCode.SUBSCRIPTION_FAILED]: 'Failed to subscribe to path',
   [RiviumSyncErrorCode.UNSUBSCRIPTION_FAILED]: 'Failed to unsubscribe from path',
   [RiviumSyncErrorCode.INVALID_PATH]: 'Invalid database path',
+  [RiviumSyncErrorCode.LISTENER_REVOKED]: 'The listener was stopped because the security rules no longer allow it',
+  [RiviumSyncErrorCode.TOO_MANY_LISTENERS]: 'Too many listeners on this connection',
+  [RiviumSyncErrorCode.PERMISSION_DENIED]: 'Permission denied by security rules',
   [RiviumSyncErrorCode.DATA_FETCH_FAILED]: 'Failed to fetch data',
   [RiviumSyncErrorCode.DATA_PARSE_ERROR]: 'Failed to parse data',
   [RiviumSyncErrorCode.DATA_WRITE_FAILED]: 'Failed to write data',
@@ -91,8 +108,29 @@ const ERROR_MESSAGES: Record<RiviumSyncErrorCode, string> = {
   [RiviumSyncErrorCode.ALREADY_CONNECTED]: 'Already connected to server',
   [RiviumSyncErrorCode.INVALID_QUERY]: 'Invalid query parameters',
   [RiviumSyncErrorCode.QUERY_EXECUTION_FAILED]: 'Query execution failed',
+  [RiviumSyncErrorCode.QUERY_NOT_ALLOWED]: 'This query is not allowed by the security rules',
   [RiviumSyncErrorCode.UNKNOWN_ERROR]: 'An unknown error occurred',
 };
+
+/**
+ * Machine-readable reason of an error, when there is one:
+ * - `query_not_allowed`: the security rules cannot allow the query (see `fields`)
+ * - `listener_revoked`: the server stopped a listener (the rules no longer allow it)
+ * - `permission_denied`: the security rules refused the request
+ * - `too_many_listeners`: too many listeners on one connection
+ */
+export type RiviumSyncErrorReason = 'query_not_allowed' | 'listener_revoked' | 'permission_denied' | 'too_many_listeners';
+
+/** Extra information an error can carry. */
+export interface RiviumSyncErrorOptions {
+  /** Replaces the default message (for example the server's message). */
+  message?: string;
+  reason?: RiviumSyncErrorReason;
+  /** `query_not_allowed`: the fields to filter on so every result is allowed. */
+  fields?: string[];
+  /** HTTP status of the answer, when the error came from the server. */
+  status?: number;
+}
 
 /**
  * Represents a RiviumSync error with code and additional details
@@ -100,12 +138,28 @@ const ERROR_MESSAGES: Record<RiviumSyncErrorCode, string> = {
 export class RiviumSyncError extends Error {
   readonly code: RiviumSyncErrorCode;
   readonly details?: string;
+  /** Machine-readable reason, e.g. `query_not_allowed` or `listener_revoked`. */
+  readonly reason?: RiviumSyncErrorReason;
+  /** `query_not_allowed`: the fields to filter on so every result is allowed. */
+  readonly fields?: string[];
+  /** HTTP status, when the error came from the server. */
+  readonly status?: number;
+  /**
+   * HTTP status of the server's answer (403 refused by the security rules,
+   * 404 not found, 5xx...); `undefined` when the server did not answer.
+   * The same value as `status`.
+   */
+  readonly statusCode?: number;
 
-  constructor(code: RiviumSyncErrorCode, details?: string) {
-    super(ERROR_MESSAGES[code] || 'Unknown error');
+  constructor(code: RiviumSyncErrorCode, details?: string, options?: RiviumSyncErrorOptions) {
+    super(options?.message || ERROR_MESSAGES[code] || 'Unknown error');
     this.name = 'RiviumSyncError';
     this.code = code;
     this.details = details;
+    this.reason = options?.reason;
+    this.fields = options?.fields;
+    this.status = options?.status;
+    this.statusCode = options?.status;
   }
 
   toJSON() {
@@ -113,8 +167,79 @@ export class RiviumSyncError extends Error {
       code: this.code,
       message: this.message,
       details: this.details,
+      ...(this.reason ? { reason: this.reason } : {}),
+      ...(this.fields ? { fields: this.fields } : {}),
+      ...(this.status !== undefined ? { status: this.status } : {}),
     };
   }
+}
+
+/**
+ * The typed error for a refused Sync API answer (403), or null when the
+ * answer is not one of those.
+ */
+function syncErrorFromResponse(status: number, body: any): RiviumSyncError | null {
+  if (status !== 403) return null;
+  const message = typeof body?.message === 'string' && body.message ? body.message : undefined;
+  if (body?.code === 'query_not_allowed') {
+    const fields = Array.isArray(body.fields) ? body.fields.filter((f: unknown) => typeof f === 'string') : undefined;
+    return new RiviumSyncError(RiviumSyncErrorCode.QUERY_NOT_ALLOWED, undefined, {
+      message,
+      reason: 'query_not_allowed',
+      fields: fields && fields.length ? fields : undefined,
+      status,
+    });
+  }
+  if (body?.code === 'too_many_listeners') {
+    return new RiviumSyncError(RiviumSyncErrorCode.TOO_MANY_LISTENERS, undefined, { message, reason: 'too_many_listeners', status });
+  }
+  return new RiviumSyncError(RiviumSyncErrorCode.PERMISSION_DENIED, undefined, { message, reason: 'permission_denied', status });
+}
+
+/**
+ * The error for a Sync API answer that is not ok: the typed refusal for a 403,
+ * `DOCUMENT_NOT_FOUND` for a 404, else `code`. Always carries the status.
+ */
+async function errorFromResponse(response: Response, code: RiviumSyncErrorCode): Promise<RiviumSyncError> {
+  const body = await response.json().catch(() => null);
+  const refused = syncErrorFromResponse(response.status, body);
+  if (refused) return refused;
+  const message = typeof body?.message === 'string' && body.message ? body.message : undefined;
+  return new RiviumSyncError(response.status === 404 ? RiviumSyncErrorCode.DOCUMENT_NOT_FOUND : code, `HTTP ${response.status}`, {
+    message,
+    status: response.status,
+  });
+}
+
+/**
+ * Which failures the offline cache may hide, as in Firestore: only those where
+ * the server could not answer for good.
+ *
+ * Transient (read from the cache, queue the write, retry later): no answer at
+ * all (no network, timeout), 401 (the user token is not there yet or is being
+ * refreshed), 408, 429 and 5xx.
+ *
+ * Anything else is the server's final answer (403 the security rules refused,
+ * 400 / 413 / 422 invalid, 404 not found, `query_not_allowed`): reads and
+ * writes report it to the app, nothing is queued, and a queued write that gets
+ * it is rolled back.
+ */
+function isTransient(error: unknown): boolean {
+  if (error instanceof RiviumSyncError) {
+    if (error.reason === 'query_not_allowed') return false;
+    const status = error.statusCode;
+    if (status !== undefined) return status === 401 || status === 408 || status === 429 || status >= 500;
+    // No answer from the server.
+    return [
+      RiviumSyncErrorCode.CONNECTION_FAILED,
+      RiviumSyncErrorCode.CONNECTION_TIMEOUT,
+      RiviumSyncErrorCode.CONNECTION_LOST,
+      RiviumSyncErrorCode.BROKER_UNAVAILABLE,
+      RiviumSyncErrorCode.NOT_CONNECTED,
+    ].includes(error.code);
+  }
+  // fetch() failing (TypeError), an abort or a timeout: the request did not get through.
+  return true;
 }
 
 // ============================================================================
@@ -190,11 +315,27 @@ export interface RiviumSyncConfig {
   syncOnReconnect?: boolean;
   /** Conflict resolution strategy (default: 'serverWins') */
   conflictStrategy?: ConflictStrategy;
-  /** Maximum sync retries (default: 3) */
+  /**
+   * @deprecated No longer limits anything: as in Firestore, a write that could not be sent (no network, server
+   * error) is retried until it goes through, and one the server refuses is rolled back (`onDocumentRejected`).
+   */
   maxSyncRetries?: number;
   /** Log level (default: DEBUG in dev, ERROR in prod) */
   logLevel?: RiviumSyncLogLevel;
+  /** For Rivium's own SDK tests; apps don't use this. */
+  useEmulator?: { host: string; port?: number };
 }
+
+/** A write sent to the server: `set()` is reported as `update`, a new document as `create`. */
+export type WriteOperation = 'create' | 'update' | 'delete';
+
+/**
+ * Called when the server refused a write that was waiting offline (the
+ * security rules, invalid data). As in Firestore the write is dropped, not
+ * retried, and the local copy goes back to what the server has (a refused new
+ * document disappears). `error` is the server's answer.
+ */
+export type DocumentRejectedListener = (documentId: string, operation: WriteOperation, error: RiviumSyncError) => void;
 
 /**
  * Internal MQTT configuration fetched from server
@@ -205,6 +346,8 @@ interface MqttConfigInternal {
   port: number;
   wsPort: number;
   password: string;
+  /** False only for a local server (`useEmulator`). */
+  useTls: boolean;
 }
 
 /**
@@ -262,6 +405,24 @@ export type ConnectionStateListener = (state: ConnectionState) => void;
 export type ErrorListener = (error: RiviumSyncError) => void;
 
 /**
+ * Called when a listener cannot start or is stopped by the server, for
+ * example `query_not_allowed` or `listener_revoked`. The listener delivers
+ * nothing more after an error.
+ */
+export type ListenerErrorCallback = (error: RiviumSyncError) => void;
+
+/**
+ * Options for `set()`.
+ */
+export interface SetOptions {
+  /**
+   * `true` merges the data into the existing document (fields not given are
+   * kept). Default `false`: the document is replaced by the data.
+   */
+  merge?: boolean;
+}
+
+/**
  * Listener unsubscribe function
  */
 export type Unsubscribe = () => void;
@@ -306,10 +467,11 @@ export class SyncCollection<T = Record<string, any>> {
   }
 
   /**
-   * Listen to collection changes
+   * Listen to collection changes. The first callback has the current
+   * documents; `onError` is called if the listener cannot start or is stopped.
    */
-  onSnapshot(callback: CollectionListener<T>, options?: QueryOptions): Unsubscribe {
-    return this.riviumSync.listenCollection<T>(this.databaseId, this.collectionId, callback, options);
+  onSnapshot(callback: CollectionListener<T>, options?: QueryOptions, onError?: ListenerErrorCallback): Unsubscribe {
+    return this.riviumSync.listenCollection<T>(this.databaseId, this.collectionId, callback, options, onError);
   }
 
   /**
@@ -369,10 +531,13 @@ export class SyncDocumentRef<T = Record<string, any>> {
   }
 
   /**
-   * Set document data (overwrite)
+   * Write the document: creates it, or replaces it when it exists.
+   * Pass `{ merge: true }` to merge the data into the existing document instead.
    */
-  async set(data: T): Promise<void> {
-    await this.riviumSync.setDocument<T>(this.databaseId, this.collectionId, this.documentId, data);
+  async set(data: T): Promise<void>;
+  async set(data: Partial<T>, options: SetOptions): Promise<void>;
+  async set(data: T | Partial<T>, options?: SetOptions): Promise<void> {
+    await this.riviumSync.setDocument<T>(this.databaseId, this.collectionId, this.documentId, data as T, options);
   }
 
   /**
@@ -390,10 +555,12 @@ export class SyncDocumentRef<T = Record<string, any>> {
   }
 
   /**
-   * Listen to document changes
+   * Listen to document changes. The first callback has the current document
+   * (`null` when it does not exist); `onError` is called if the listener
+   * cannot start or is stopped.
    */
-  onSnapshot(callback: DocumentListener<T>): Unsubscribe {
-    return this.riviumSync.listenDocument<T>(this.databaseId, this.collectionId, this.documentId, callback);
+  onSnapshot(callback: DocumentListener<T>, onError?: ListenerErrorCallback): Unsubscribe {
+    return this.riviumSync.listenDocument<T>(this.databaseId, this.collectionId, this.documentId, callback, onError);
   }
 }
 
@@ -460,10 +627,12 @@ export class SyncQuery<T = Record<string, any>> {
   }
 
   /**
-   * Listen to query results
+   * Listen to query results. The first callback has the current results;
+   * `onError` is called if the listener cannot start (for example
+   * `query_not_allowed`) or is stopped.
    */
-  onSnapshot(callback: CollectionListener<T>): Unsubscribe {
-    return this.riviumSync.listenCollection<T>(this.databaseId, this.collectionId, callback, this.options);
+  onSnapshot(callback: CollectionListener<T>, onError?: ListenerErrorCallback): Unsubscribe {
+    return this.riviumSync.listenCollection<T>(this.databaseId, this.collectionId, callback, { ...this.options, filters: this.options.filters ? [...this.options.filters] : undefined }, onError);
   }
 }
 
@@ -552,6 +721,8 @@ interface BatchOperation {
   collectionId: string;
   documentId?: string;
   data?: any;
+  /** set only: true merges, false replaces. */
+  merge?: boolean;
 }
 
 /**
@@ -593,13 +764,17 @@ export class WriteBatch {
   /**
    * Writes to the document referred to by the provided document reference.
    * If the document does not exist yet, it will be created.
-   * If the document exists, its contents will be overwritten.
+   * If the document exists, its contents will be overwritten, unless
+   * `{ merge: true }` is passed: then the data is merged into it.
    *
    * @param docRef - The document reference to write to
    * @param data - The data to write to the document
+   * @param options - `{ merge: true }` to merge instead of replace
    * @returns This WriteBatch instance for chaining
    */
-  set<T>(docRef: SyncDocumentRef<T>, data: T): WriteBatch {
+  set<T>(docRef: SyncDocumentRef<T>, data: T): WriteBatch;
+  set<T>(docRef: SyncDocumentRef<T>, data: Partial<T>, options: SetOptions): WriteBatch;
+  set<T>(docRef: SyncDocumentRef<T>, data: T | Partial<T>, options?: SetOptions): WriteBatch {
     this.checkNotCommitted();
     const { databaseId, collectionId, documentId } = this.extractRefInfo(docRef);
     this.operations.push({
@@ -608,6 +783,7 @@ export class WriteBatch {
       collectionId,
       documentId,
       data,
+      merge: options?.merge === true,
     });
     return this;
   }
@@ -851,6 +1027,10 @@ class OfflineCache {
     type: 'set' | 'update' | 'delete' | 'add';
     path: string;
     data?: any;
+    /** set only: true merges, false replaces. */
+    merge?: boolean;
+    /** add only: the temp_ id of the document in the cache. */
+    tempId?: string;
     baseVersion?: number;
   }): Promise<void> {
     if (!this.db) return;
@@ -923,6 +1103,96 @@ class OfflineCache {
 }
 
 // ============================================================================
+// Listeners (internal)
+// ============================================================================
+
+/** One onSnapshot() call. */
+interface ActiveListener {
+  kind: 'document' | 'query';
+  databaseId: string;
+  collectionId: string;
+  documentId?: string;
+  options?: QueryOptions;
+  onDocument?: DocumentListener<any>;
+  onDocuments?: CollectionListener<any>;
+  onError?: ListenerErrorCallback;
+  /** What it knows: documentId → { data, version }. */
+  state: ListenerState;
+  /**
+   * waiting: not started (no connection yet) · starting: POST …/listen in flight ·
+   * server: has a private topic · legacy: older realtime topics · stopped
+   */
+  mode: 'waiting' | 'starting' | 'server' | 'legacy' | 'stopped';
+  subscriptionId?: string;
+  topic?: string;
+  expiresAt?: number;
+  /** The user it was started as (null without a signed user token). */
+  user?: string | null;
+  /** Bumped on every start / stop, so an older answer is ignored. */
+  generation: number;
+  retryAttempts: number;
+  retryTimer?: ReturnType<typeof setTimeout>;
+  relistenTimer?: ReturnType<typeof setTimeout>;
+  /** Subscribe refusals in a row. */
+  refusals: number;
+  /** What the app got last (see deliveryKey). */
+  lastKey?: string;
+}
+
+// ============================================================================
+// Answers of the Sync API
+// ============================================================================
+//
+// SDK routes answer `{ data: … }` (a document, or a list with `total`). A bare
+// shape is accepted too. A bare document always has an `id`, and its own
+// `data` is the document's content, so only an object without `id` is a wrapper.
+
+/** `{ data: document }` → the document; a bare document as is; `{ data: null }` → null. */
+function unwrapDocument<T = any>(body: unknown): SyncDocument<T> | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  if (!('id' in b) && 'data' in b) {
+    const inner = b.data;
+    return inner && typeof inner === 'object' && !Array.isArray(inner) ? (inner as SyncDocument<T>) : null;
+  }
+  return b as unknown as SyncDocument<T>;
+}
+
+/** `{ data: [...], total }`, `{ documents: [...] }` or a bare array → the documents. */
+function unwrapDocuments<T>(body: unknown): SyncDocument<T>[] {
+  if (Array.isArray(body)) return body as SyncDocument<T>[];
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  if (Array.isArray(b.data)) return b.data as SyncDocument<T>[];
+  if (Array.isArray(b.documents)) return b.documents as SyncDocument<T>[];
+  return [];
+}
+
+/** `{ data: [...] }` or a bare array → the list (databases, collections). */
+function unwrapList<T>(body: unknown): T[] {
+  if (Array.isArray(body)) return body as T[];
+  const data = (body as any)?.data;
+  return Array.isArray(data) ? (data as T[]) : [];
+}
+
+/** `{ data: object }` or a bare object (databases, collections). */
+function unwrapObject<T>(body: unknown): T {
+  const b = body as any;
+  if (b && typeof b === 'object' && !('id' in b) && b.data && typeof b.data === 'object' && !Array.isArray(b.data)) return b.data as T;
+  return b as T;
+}
+
+function generateId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+// ============================================================================
 // RiviumSync Main Class
 // ============================================================================
 
@@ -968,8 +1238,19 @@ class RiviumSync {
   private static readonly MQTT_WS_HOST = 'ws-sync.rivium.co';
   private static readonly MQTT_WS_PORT = 443;
   private static readonly MQTT_WS_PATH = '/mqtt';
+  /** A local Rivium Sync server's API port and realtime (WebSocket) port (`useEmulator`). */
+  private static readonly DEFAULT_EMULATOR_PORT = 3006;
+  private static readonly DEFAULT_EMULATOR_WS_PORT = 8383;
+  /** A listener is started again this long before its subscription expires. */
+  private static readonly RELISTEN_BEFORE_EXPIRY_MS = 60 * 60 * 1000;
+  /** Used when the server's answer has no readable expiry. */
+  private static readonly LISTENER_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
   private config: Required<Pick<RiviumSyncConfig, 'apiKey'>> & RiviumSyncConfig;
+  /** Where the API is: Rivium's, or a local server (`useEmulator`). */
+  private readonly apiUrl: string;
+  /** Set by `useEmulator`: the local server's host. */
+  private readonly emulatorHost: string | null = null;
   /** Resolved userId for Security Rules (auth.uid) */
   public readonly userId: string;
   private mqttClient: MqttClient | null = null;
@@ -988,17 +1269,35 @@ class RiviumSync {
   private isSyncing = false;
 
   // Listeners
-  private documentListeners: Map<string, Set<DocumentListener<any>>> = new Map();
-  private collectionListeners: Map<string, Set<{ callback: CollectionListener<any>; options?: QueryOptions }>> = new Map();
+  private listeners: Set<ActiveListener> = new Set();
+  /** Private topic → its server listener. */
+  private serverTopics: Map<string, ActiveListener> = new Map();
+  /** null = not known yet, false = the server has no POST …/listen (older server). */
+  private serverListenersAvailable: boolean | null = null;
+  /** The MQTT client id, the same for every connection of this instance. */
+  private readonly mqttClientId: string = `rivium_sync_web_${generateId()}`;
   private connectionStateListeners: Set<ConnectionStateListener> = new Set();
   private errorListeners: Set<ErrorListener> = new Set();
-
-  // Cached data for listeners
-  private cachedCollections: Map<string, SyncDocument<any>[]> = new Map();
+  private documentRejectedListeners: Set<DocumentRejectedListener> = new Set();
 
   constructor(config: RiviumSyncConfig) {
     if (!config.apiKey) {
       throw new RiviumSyncError(RiviumSyncErrorCode.MISSING_API_KEY);
+    }
+
+    if (config.useEmulator) {
+      const host = typeof config.useEmulator.host === 'string' ? config.useEmulator.host.trim() : '';
+      const port = config.useEmulator.port ?? RiviumSync.DEFAULT_EMULATOR_PORT;
+      if (!host || /[/:\s]/.test(host)) {
+        throw new RiviumSyncError(RiviumSyncErrorCode.INVALID_CONFIG, undefined, { message: 'useEmulator: host is a host name or IP address, without scheme or port' });
+      }
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new RiviumSyncError(RiviumSyncErrorCode.INVALID_CONFIG, undefined, { message: 'useEmulator: port must be 1-65535' });
+      }
+      this.emulatorHost = host;
+      this.apiUrl = `http://${host}:${port}`;
+    } else {
+      this.apiUrl = RiviumSync.DEFAULT_SERVER_URL;
     }
 
     this.config = {
@@ -1233,8 +1532,12 @@ class RiviumSync {
   // ==========================================================================
 
   private emitError(code: RiviumSyncErrorCode, details?: string): void {
-    const error = new RiviumSyncError(code, details);
-    this.log(RiviumSyncLogLevel.ERROR, `Error [${code}]: ${error.message}`, details);
+    this.emitTypedError(new RiviumSyncError(code, details));
+  }
+
+  /** Report an error to every `onError` listener. */
+  private emitTypedError(error: RiviumSyncError): void {
+    this.log(RiviumSyncLogLevel.ERROR, `Error [${error.code}]: ${error.message}`, error.details);
 
     this.errorListeners.forEach((listener) => {
       try {
@@ -1254,7 +1557,7 @@ class RiviumSync {
       this.log(RiviumSyncLogLevel.DEBUG, 'Fetching MQTT token...');
 
       // Fetch JWT token from API (validates API key, returns short-lived token)
-      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/connections/token`, {
+      const response = await this.authedFetch(`${this.apiUrl}/connections/token`, {
         method: 'POST',
       });
 
@@ -1289,13 +1592,29 @@ class RiviumSync {
       // the server, so the same database name in two projects cannot collide.
       this.projectId = tokenData.projectId ?? null;
 
-      this.mqttConfig = {
-        host: RiviumSync.MQTT_WS_HOST,
-        wsHost: RiviumSync.MQTT_WS_HOST,
-        port: RiviumSync.MQTT_WS_PORT,
-        wsPort: RiviumSync.MQTT_WS_PORT,
-        password: tokenData.token,
-      };
+      if (this.emulatorHost) {
+        // A local server (useEmulator): its host, the WebSocket port it
+        // reports, no TLS. `mqtt.port` in the answer is the TCP one, not ours.
+        const reported = tokenData.mqtt?.wsPort;
+        const wsPort = Number.isInteger(reported) && reported >= 1 && reported <= 65535 ? reported : RiviumSync.DEFAULT_EMULATOR_WS_PORT;
+        this.mqttConfig = {
+          host: this.emulatorHost,
+          wsHost: this.emulatorHost,
+          port: wsPort,
+          wsPort,
+          password: tokenData.token,
+          useTls: false,
+        };
+      } else {
+        this.mqttConfig = {
+          host: RiviumSync.MQTT_WS_HOST,
+          wsHost: RiviumSync.MQTT_WS_HOST,
+          port: RiviumSync.MQTT_WS_PORT,
+          wsPort: RiviumSync.MQTT_WS_PORT,
+          password: tokenData.token,
+          useTls: true,
+        };
+      }
       this.mqttConfigFetched = true;
 
       this.log(RiviumSyncLogLevel.INFO, `MQTT config initialized with token: wsHost=${this.mqttConfig.wsHost}, wsPort=${this.mqttConfig.wsPort}`);
@@ -1304,7 +1623,11 @@ class RiviumSync {
       this.connectMqtt();
     } catch (error) {
       this.log(RiviumSyncLogLevel.ERROR, 'Failed to fetch MQTT token:', error);
-      this.emitError(RiviumSyncErrorCode.INVALID_CONFIG, `Failed to fetch MQTT token: ${(error as Error).message}`);
+      // Told once per run of failures, then retried with the reconnect backoff (no network yet, a server error).
+      if (this.reconnectAttempts === 0) {
+        this.emitError(RiviumSyncErrorCode.INVALID_CONFIG, `Failed to fetch MQTT token: ${(error as Error).message}`);
+      }
+      if (this.wantConnected) this.scheduleReconnect();
     }
   }
 
@@ -1407,7 +1730,7 @@ class RiviumSync {
    */
   async listDatabases(): Promise<DatabaseInfo[]> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases`, {
+    const response = await this.authedFetch(`${this.apiUrl}/databases`, {
       method: 'GET',
     });
 
@@ -1415,8 +1738,7 @@ class RiviumSync {
       throw new RiviumSyncError(RiviumSyncErrorCode.DATA_FETCH_FAILED, `Failed to list databases: HTTP ${response.status}`);
     }
 
-    const data = await response.json();
-    return data.data || data || [];
+    return unwrapList(await response.json());
   }
 
   /**
@@ -1424,7 +1746,7 @@ class RiviumSync {
    */
   async createDatabase(name: string): Promise<DatabaseInfo> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases`, {
+    const response = await this.authedFetch(`${this.apiUrl}/databases`, {
       method: 'POST',
       body: JSON.stringify({ name }),
     });
@@ -1433,8 +1755,7 @@ class RiviumSync {
       throw new RiviumSyncError(RiviumSyncErrorCode.DATA_WRITE_FAILED, `Failed to create database: HTTP ${response.status}`);
     }
 
-    const data = await response.json();
-    return data.data || data;
+    return unwrapObject(await response.json());
   }
 
   /**
@@ -1445,7 +1766,7 @@ class RiviumSync {
    */
   async deleteDatabase(databaseId: string): Promise<void> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}`, {
+    const response = await this.authedFetch(`${this.apiUrl}/databases/${databaseId}`, {
       method: 'DELETE',
     });
 
@@ -1461,7 +1782,7 @@ class RiviumSync {
    */
   async listCollections(databaseName: string): Promise<CollectionInfo[]> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseName}/collections`, {
+    const response = await this.authedFetch(`${this.apiUrl}/databases/${databaseName}/collections`, {
       method: 'GET',
     });
 
@@ -1469,8 +1790,7 @@ class RiviumSync {
       throw new RiviumSyncError(RiviumSyncErrorCode.DATA_FETCH_FAILED, `Failed to list collections: HTTP ${response.status}`);
     }
 
-    const data = await response.json();
-    return data.data || data || [];
+    return unwrapList(await response.json());
   }
 
   /**
@@ -1481,7 +1801,7 @@ class RiviumSync {
    */
   async createCollection(databaseName: string, name: string): Promise<CollectionInfo> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseName}/collections`, {
+    const response = await this.authedFetch(`${this.apiUrl}/databases/${databaseName}/collections`, {
       method: 'POST',
       body: JSON.stringify({ name }),
     });
@@ -1490,8 +1810,7 @@ class RiviumSync {
       throw new RiviumSyncError(RiviumSyncErrorCode.DATA_WRITE_FAILED, `Failed to create collection: HTTP ${response.status}`);
     }
 
-    const data = await response.json();
-    return data.data || data;
+    return unwrapObject(await response.json());
   }
 
   /**
@@ -1520,14 +1839,14 @@ class RiviumSync {
    */
   async executeBatch(operations: BatchOperation[]): Promise<void> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/batch/sdk`, {
+    const response = await this.authedFetch(`${this.apiUrl}/batch/sdk`, {
       method: 'POST',
       body: JSON.stringify({ operations }),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new RiviumSyncError(RiviumSyncErrorCode.DATA_WRITE_FAILED, `Batch commit failed: ${errorText}`);
+      throw new RiviumSyncError(RiviumSyncErrorCode.DATA_WRITE_FAILED, `Batch commit failed: ${errorText}`, { status: response.status });
     }
   }
 
@@ -1562,6 +1881,19 @@ class RiviumSync {
     this.errorListeners.add(callback);
     return () => {
       this.errorListeners.delete(callback);
+    };
+  }
+
+  /**
+   * Called when the server refuses a write that was made offline and sent
+   * later (your security rules, invalid data). The write is dropped and the
+   * local copy goes back to the server's: a refused new document disappears,
+   * a refused update or delete shows the server's document again.
+   */
+  onDocumentRejected(callback: DocumentRejectedListener): Unsubscribe {
+    this.documentRejectedListeners.add(callback);
+    return () => {
+      this.documentRejectedListeners.delete(callback);
     };
   }
 
@@ -1628,7 +1960,6 @@ class RiviumSync {
   async clearOfflineCache(): Promise<void> {
     if (!this.offlineCache) return;
     await this.offlineCache.clearAll();
-    this.cachedCollections.clear();
     this.log(RiviumSyncLogLevel.INFO, 'Offline cache cleared');
   }
 
@@ -1661,9 +1992,12 @@ class RiviumSync {
    * Disconnect from server
    */
   disconnect(): void {
+    // Offline from now on, not when the socket reports closing later: a write
+    // made right after disconnect() is queued, never sent.
     this.wantConnected = false;
     this.awaitingUserToken = false;
     this.disconnectMqtt();
+    this.setSyncState('offline');
   }
 
   /**
@@ -1671,11 +2005,22 @@ class RiviumSync {
    */
   reconnect(): void {
     this.wantConnected = true;
+    if (this._syncState === 'offline' && !this.isKnownOffline()) {
+      this.setSyncState('idle');
+    }
     if (this.mqttConfigFetched) {
       this.connectMqtt();
     } else {
       this.fetchMqttConfig();
     }
+  }
+
+  /**
+   * True when writes are queued and reads answered from the cache: the browser
+   * is offline, or the app called `disconnect()` / `goOffline()`.
+   */
+  private isKnownOffline(): boolean {
+    return !this.wantConnected || (typeof navigator !== 'undefined' && navigator.onLine === false);
   }
 
   /**
@@ -1727,24 +2072,19 @@ class RiviumSync {
   async getDocument<T>(databaseId: string, collectionId: string, documentId: string): Promise<SyncDocument<T> | null> {
     const path = `/${databaseId}/${collectionId}/${documentId}`;
 
+    // Known offline: the cached copy. Without one the error is thrown: null
+    // means the document does not exist, never "could not reach the server".
+    if (this.offlineCache && this.isKnownOffline()) {
+      const cached = unwrapDocument<T>(await this.offlineCache.get(path));
+      if (cached) return cached;
+      throw new RiviumSyncError(RiviumSyncErrorCode.NOT_CONNECTED, `Offline, and document '${documentId}' is not in the local cache`);
+    }
+
     try {
-
-      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
-        method: 'GET',
-      });
-
-      if (response.status === 404) {
-        return null;
-      }
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const data = await response.json();
+      const data = await this.fetchDocumentFromServer<T>(databaseId, collectionId, documentId);
 
       // Cache the result
-      if (this.offlineCache) {
+      if (this.offlineCache && data) {
         await this.offlineCache.set(path, data);
       }
 
@@ -1752,16 +2092,17 @@ class RiviumSync {
     } catch (error) {
       this.log(RiviumSyncLogLevel.ERROR, 'Failed to get document:', error);
 
-      // Try offline cache
-      if (this.offlineCache) {
-        const cached = await this.offlineCache.get(path);
+      // The cache stands in only when the server could not answer; a refusal
+      // (the security rules, 403) is the app's to see.
+      if (this.offlineCache && isTransient(error)) {
+        const cached = unwrapDocument<T>(await this.offlineCache.get(path));
         if (cached) {
           this.log(RiviumSyncLogLevel.DEBUG, 'Returning cached document');
           return cached;
         }
       }
 
-      this.emitError(RiviumSyncErrorCode.DATA_FETCH_FAILED, (error as Error).message);
+      this.reportError(error, RiviumSyncErrorCode.DATA_FETCH_FAILED);
       throw error;
     }
   }
@@ -1770,78 +2111,39 @@ class RiviumSync {
     const path = `/${databaseId}/${collectionId}`;
 
     // Offline-first: if offline, return cached data immediately
-    if (!navigator.onLine) {
+    if (this.offlineCache && this.isKnownOffline()) {
       this.log(RiviumSyncLogLevel.INFO, 'Offline mode: returning cached documents');
-      if (this.offlineCache) {
-        const cached = await this.offlineCache.get(path);
-        if (cached) {
-          // Apply local filters/ordering if needed
-          let docs = cached as SyncDocument<T>[];
-          if (options?.filters) {
-            docs = this.applyFilters(docs, options.filters) as SyncDocument<T>[];
-          }
-          if (options?.orderBy) {
-            docs = this.applyOrdering(docs, options.orderBy, options.orderDirection) as SyncDocument<T>[];
-          }
-          if (options?.limit) {
-            docs = docs.slice(options.offset || 0, (options.offset || 0) + options.limit);
-          }
-          return docs;
-        }
-      }
-      return [];
+      return this.cachedDocuments<T>(path, options);
     }
 
     try {
 
-      const queryParams = new URLSearchParams();
+      // POST …/documents/sdk/query: filters, order, limit and offset in the body
+      // (values keep their JSON type: numbers and booleans are not stringified).
+      const body: Record<string, any> = {};
       if (options?.filters && options.filters.length > 0) {
-        // Convert Firebase-style filters to MongoDB-style for backend
-        // From: [{field: "completed", operator: "==", value: true}]
-        // To: {"completed": {"$eq": true}}
-        const mongoFilter: Record<string, any> = {};
-        for (const f of options.filters) {
-          const operatorMap: Record<string, string> = {
-            '==': '$eq',
-            '!=': '$ne',
-            '<': '$lt',
-            '<=': '$lte',
-            '>': '$gt',
-            '>=': '$gte',
-            'in': '$in',
-            'not-in': '$nin',
-            'array-contains': '$contains',
-          };
-          const mongoOp = operatorMap[f.operator] || '$eq';
-          mongoFilter[f.field] = { [mongoOp]: f.value };
-        }
-        queryParams.set('filter', JSON.stringify(mongoFilter));
+        body.filters = options.filters.map((f) => ({ field: f.field, operator: f.operator, value: f.value }));
       }
       if (options?.orderBy) {
-        // Convert orderBy to MongoDB-style sort
-        const sortDirection = options.orderDirection === 'desc' ? -1 : 1;
-        queryParams.set('sort', JSON.stringify({ [options.orderBy]: sortDirection }));
+        body.orderBy = { field: options.orderBy, direction: options.orderDirection === 'desc' ? 'desc' : 'asc' };
       }
-      if (options?.limit) {
-        queryParams.set('limit', options.limit.toString());
-      }
-      if (options?.offset) {
-        queryParams.set('offset', options.offset.toString());
-      }
+      if (options?.limit) body.limit = options.limit;
+      if (options?.offset) body.offset = options.offset;
 
-      const url = `${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk?${queryParams}`;
+      const url = `${this.apiUrl}/databases/${databaseId}/collections/${collectionId}/documents/sdk/query`;
 
       const response = await this.authedFetch(url, {
-        method: 'GET',
+        method: 'POST',
+        body: JSON.stringify(body),
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        throw await errorFromResponse(response, RiviumSyncErrorCode.QUERY_EXECUTION_FAILED);
       }
 
       const responseData = await response.json();
       // Backend returns { data: documents[], total, skip, limit }
-      const documents = responseData.data || responseData.documents || responseData || [];
+      const documents = unwrapDocuments<T>(responseData);
 
       // Cache the results
       if (this.offlineCache) {
@@ -1852,183 +2154,175 @@ class RiviumSync {
     } catch (error) {
       this.log(RiviumSyncLogLevel.ERROR, 'Failed to get documents:', error);
 
-      // Try offline cache
-      if (this.offlineCache) {
+      // The cache stands in only when the server could not answer. A refusal
+      // (query_not_allowed, read denied) would be hidden by a cached answer,
+      // so it goes straight to the caller.
+      if (this.offlineCache && isTransient(error)) {
         const cached = await this.offlineCache.get(path);
         if (cached) {
           this.log(RiviumSyncLogLevel.DEBUG, 'Returning cached documents');
-          return cached;
+          return this.cachedDocuments<T>(path, options);
         }
       }
 
-      this.emitError(RiviumSyncErrorCode.DATA_FETCH_FAILED, (error as Error).message);
+      this.reportError(error, RiviumSyncErrorCode.DATA_FETCH_FAILED);
       throw error;
     }
+  }
+
+  /** The cached documents of a collection, with the query applied on the device. */
+  private async cachedDocuments<T>(path: string, options?: QueryOptions): Promise<SyncDocument<T>[]> {
+    const cached = this.offlineCache ? await this.offlineCache.get(path) : null;
+    if (!Array.isArray(cached)) return [];
+    let docs = cached as SyncDocument<T>[];
+    if (options?.filters) {
+      docs = this.applyFilters(docs, options.filters) as SyncDocument<T>[];
+    }
+    if (options?.orderBy) {
+      docs = this.applyOrdering(docs, options.orderBy, options.orderDirection) as SyncDocument<T>[];
+    }
+    if (options?.limit || options?.offset) {
+      const offset = options.offset || 0;
+      docs = docs.slice(offset, options.limit ? offset + options.limit : undefined);
+    }
+    return docs;
   }
 
   async addDocument<T>(databaseId: string, collectionId: string, data: T): Promise<SyncDocument<T>> {
     const path = `/${databaseId}/${collectionId}`;
 
     // Offline-first: if offline, store locally and queue for sync
-    if (!navigator.onLine) {
+    if (this.offlineCache && this.isKnownOffline()) {
       this.log(RiviumSyncLogLevel.INFO, 'Offline mode: storing document locally');
-
-      // Generate a temporary ID
-      const tempId = `temp_${this.generateUUID()}`;
-      const now = new Date().toISOString();
-
-      const tempDocument: SyncDocument<T> = {
-        id: tempId,
-        data,
-        createdAt: now,
-        updatedAt: now,
-        version: 0,
-      };
-
-      // Store in local cache
-      if (this.offlineCache) {
-        // Get existing cached documents for this collection
-        const cached = await this.offlineCache.get(path) || [];
-        cached.push(tempDocument);
-        await this.offlineCache.set(path, cached);
-
-        // Queue for sync when online
-        await this.offlineCache.addPendingWrite({
-          type: 'add',
-          path,
-          data,
-        });
-        this.log(RiviumSyncLogLevel.INFO, 'Document queued for offline sync');
-      }
-
-      return tempDocument;
+      return this.queueAdd(path, data);
     }
 
     // Online: make API call
     try {
-
-      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk`, {
-        method: 'POST',
-        body: JSON.stringify({ data }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const result = await response.json();
+      const serverDoc = await this.addDocumentToServer<T>(databaseId, collectionId, data);
 
       // Update cache with server response
-      if (this.offlineCache) {
-        const cached = await this.offlineCache.get(path) || [];
-        const serverDoc = result.data || result;
-        cached.push(serverDoc);
-        await this.offlineCache.set(path, cached);
+      if (this.offlineCache && serverDoc) {
+        await this.putInCachedCollection(path, serverDoc.id, serverDoc);
       }
 
-      return result.data || result;
+      return serverDoc;
     } catch (error) {
       this.log(RiviumSyncLogLevel.ERROR, 'Failed to add document:', error);
 
-      // Network error while we thought we were online - queue for sync
-      if (this.offlineCache) {
-        const tempId = `temp_${this.generateUUID()}`;
-        const now = new Date().toISOString();
-
-        const tempDocument: SyncDocument<T> = {
-          id: tempId,
-          data,
-          createdAt: now,
-          updatedAt: now,
-          version: 0,
-        };
-
-        const cached = await this.offlineCache.get(path) || [];
-        cached.push(tempDocument);
-        await this.offlineCache.set(path, cached);
-
-        await this.offlineCache.addPendingWrite({
-          type: 'add',
-          path,
-          data,
-        });
+      // The server could not answer - queue for sync. Its final answer (the
+      // rules refused it, invalid data) is the app's to see, never queued.
+      if (this.offlineCache && isTransient(error)) {
+        const tempDocument = await this.queueAdd(path, data);
         this.log(RiviumSyncLogLevel.INFO, 'Document queued for offline sync (network error)');
-
         return tempDocument;
       }
 
-      this.emitError(RiviumSyncErrorCode.DATA_WRITE_FAILED, (error as Error).message);
+      this.reportError(error, RiviumSyncErrorCode.DATA_WRITE_FAILED);
       throw error;
     }
   }
 
-  async setDocument<T>(databaseId: string, collectionId: string, documentId: string, data: T): Promise<void> {
+  /** A new document made offline: a temp_ id in the cache, the add queued. */
+  private async queueAdd<T>(path: string, data: T): Promise<SyncDocument<T>> {
+    const tempId = `temp_${this.generateUUID()}`;
+    const now = new Date().toISOString();
+
+    const tempDocument: SyncDocument<T> = {
+      id: tempId,
+      data,
+      createdAt: now,
+      updatedAt: now,
+      version: 0,
+    };
+
+    if (this.offlineCache) {
+      // Get existing cached documents for this collection
+      const cached = (await this.offlineCache.get(path)) || [];
+      cached.push(tempDocument);
+      await this.offlineCache.set(path, cached);
+
+      // Queue for sync when online (with the temp id, to swap or roll it back)
+      await this.offlineCache.addPendingWrite({
+        type: 'add',
+        path,
+        data,
+        tempId,
+      });
+      this.log(RiviumSyncLogLevel.INFO, 'Document queued for offline sync');
+    }
+
+    return tempDocument;
+  }
+
+  async setDocument<T>(databaseId: string, collectionId: string, documentId: string, data: T, options?: SetOptions): Promise<void> {
     const path = `/${databaseId}/${collectionId}/${documentId}`;
     const collectionPath = `/${databaseId}/${collectionId}`;
+    const merge = options?.merge === true;
+
+    // What the document looks like after this write, in the local cache.
+    const cacheWrite = async () => {
+      if (!this.offlineCache) return;
+      const existing = merge ? unwrapDocument(await this.offlineCache.get(path)) : null;
+      const newData = merge && existing?.data ? { ...existing.data, ...(data as any) } : data;
+      await this.offlineCache.set(path, { ...(merge && existing ? existing : {}), id: documentId, data: newData });
+      return newData;
+    };
 
     // Offline-first: if offline, store locally and queue for sync
-    if (!navigator.onLine) {
+    if (this.offlineCache && this.isKnownOffline()) {
       this.log(RiviumSyncLogLevel.INFO, 'Offline mode: storing document locally');
 
-      if (this.offlineCache) {
-        // Update document in cache
-        await this.offlineCache.set(path, { id: documentId, data });
+      // Update document in cache
+      const newData = await cacheWrite();
 
-        // Also update in collection cache if exists
-        const cached = await this.offlineCache.get(collectionPath);
-        if (cached && Array.isArray(cached)) {
-          const idx = cached.findIndex((d: any) => d.id === documentId);
-          if (idx >= 0) {
-            cached[idx] = { ...cached[idx], data, updatedAt: new Date().toISOString() };
-          } else {
-            cached.push({ id: documentId, data, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
-          }
-          await this.offlineCache.set(collectionPath, cached);
+      // Also update in collection cache if exists
+      const cached = await this.offlineCache.get(collectionPath);
+      if (cached && Array.isArray(cached)) {
+        const idx = cached.findIndex((d: any) => d.id === documentId);
+        if (idx >= 0) {
+          const nextData = merge ? { ...cached[idx].data, ...(data as any) } : newData;
+          cached[idx] = { ...cached[idx], data: nextData, updatedAt: new Date().toISOString() };
+        } else {
+          cached.push({ id: documentId, data: newData, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
         }
-
-        // Queue for sync when online
-        await this.offlineCache.addPendingWrite({
-          type: 'set',
-          path,
-          data,
-        });
-        this.log(RiviumSyncLogLevel.INFO, 'Document set queued for offline sync');
+        await this.offlineCache.set(collectionPath, cached);
       }
+
+      // Queue for sync when online (the merge flag goes with it)
+      await this.offlineCache.addPendingWrite({
+        type: 'set',
+        path,
+        data,
+        merge,
+      });
+      this.log(RiviumSyncLogLevel.INFO, 'Document set queued for offline sync');
       return;
     }
 
     // Online: make API call
     try {
-
-      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
-        method: 'PUT',
-        body: JSON.stringify({ data }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      await this.setDocumentOnServer(databaseId, collectionId, documentId, data, merge);
 
       // Update cache
-      if (this.offlineCache) {
-        await this.offlineCache.set(path, { id: documentId, data });
-      }
+      await cacheWrite();
     } catch (error) {
       this.log(RiviumSyncLogLevel.ERROR, 'Failed to set document:', error);
 
-      // Network error - queue for offline sync
-      if (this.offlineCache) {
-        await this.offlineCache.set(path, { id: documentId, data });
+      // The server could not answer - queue for offline sync. A refusal is thrown.
+      if (this.offlineCache && isTransient(error)) {
+        await cacheWrite();
         await this.offlineCache.addPendingWrite({
           type: 'set',
           path,
           data,
+          merge,
         });
         this.log(RiviumSyncLogLevel.INFO, 'Document set queued for offline sync (network error)');
         return;
       }
 
-      this.emitError(RiviumSyncErrorCode.DATA_WRITE_FAILED, (error as Error).message);
+      this.reportError(error, RiviumSyncErrorCode.DATA_WRITE_FAILED);
       throw error;
     }
   }
@@ -2038,53 +2332,43 @@ class RiviumSync {
     const collectionPath = `/${databaseId}/${collectionId}`;
 
     // Offline-first: if offline, store locally and queue for sync
-    if (!navigator.onLine) {
+    if (this.offlineCache && this.isKnownOffline()) {
       this.log(RiviumSyncLogLevel.INFO, 'Offline mode: updating document locally');
 
-      if (this.offlineCache) {
-        // Update document in cache (merge with existing)
-        const existing = await this.offlineCache.get(path);
-        const merged = existing ? { ...existing, data: { ...existing.data, ...data }, updatedAt: new Date().toISOString() } : { id: documentId, data, updatedAt: new Date().toISOString() };
-        await this.offlineCache.set(path, merged);
+      // Update document in cache (merge with existing)
+      const existing = unwrapDocument(await this.offlineCache.get(path));
+      const merged = existing ? { ...existing, data: { ...existing.data, ...data }, updatedAt: new Date().toISOString() } : { id: documentId, data, updatedAt: new Date().toISOString() };
+      await this.offlineCache.set(path, merged);
 
-        // Also update in collection cache if exists
-        const cached = await this.offlineCache.get(collectionPath);
-        if (cached && Array.isArray(cached)) {
-          const idx = cached.findIndex((d: any) => d.id === documentId);
-          if (idx >= 0) {
-            cached[idx] = { ...cached[idx], data: { ...cached[idx].data, ...data }, updatedAt: new Date().toISOString() };
-            await this.offlineCache.set(collectionPath, cached);
-          }
+      // Also update in collection cache if exists
+      const cached = await this.offlineCache.get(collectionPath);
+      if (cached && Array.isArray(cached)) {
+        const idx = cached.findIndex((d: any) => d.id === documentId);
+        if (idx >= 0) {
+          cached[idx] = { ...cached[idx], data: { ...cached[idx].data, ...data }, updatedAt: new Date().toISOString() };
+          await this.offlineCache.set(collectionPath, cached);
         }
-
-        // Queue for sync when online
-        await this.offlineCache.addPendingWrite({
-          type: 'update',
-          path,
-          data,
-        });
-        this.log(RiviumSyncLogLevel.INFO, 'Document update queued for offline sync');
       }
+
+      // Queue for sync when online
+      await this.offlineCache.addPendingWrite({
+        type: 'update',
+        path,
+        data,
+      });
+      this.log(RiviumSyncLogLevel.INFO, 'Document update queued for offline sync');
       return;
     }
 
     // Online: make API call
     try {
-
-      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ data }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      await this.updateDocumentOnServer(databaseId, collectionId, documentId, data);
     } catch (error) {
       this.log(RiviumSyncLogLevel.ERROR, 'Failed to update document:', error);
 
-      // Network error - queue for offline sync
-      if (this.offlineCache) {
-        const existing = await this.offlineCache.get(path);
+      // The server could not answer - queue for offline sync. A refusal is thrown.
+      if (this.offlineCache && isTransient(error)) {
+        const existing = unwrapDocument(await this.offlineCache.get(path));
         const merged = existing ? { ...existing, data: { ...existing.data, ...data }, updatedAt: new Date().toISOString() } : { id: documentId, data, updatedAt: new Date().toISOString() };
         await this.offlineCache.set(path, merged);
 
@@ -2097,7 +2381,7 @@ class RiviumSync {
         return;
       }
 
-      this.emitError(RiviumSyncErrorCode.DATA_WRITE_FAILED, (error as Error).message);
+      this.reportError(error, RiviumSyncErrorCode.DATA_WRITE_FAILED);
       throw error;
     }
   }
@@ -2107,57 +2391,46 @@ class RiviumSync {
     const collectionPath = `/${databaseId}/${collectionId}`;
 
     // Offline-first: if offline, remove from local cache and queue for sync
-    if (!navigator.onLine) {
+    if (this.offlineCache && this.isKnownOffline()) {
       this.log(RiviumSyncLogLevel.INFO, 'Offline mode: deleting document locally');
 
-      if (this.offlineCache) {
-        // Remove from document cache
-        await this.offlineCache.delete(path);
+      await this.offlineCache.delete(path);
+      await this.putInCachedCollection(collectionPath, documentId, null);
 
-        // Also remove from collection cache if exists
-        const cached = await this.offlineCache.get(collectionPath);
-        if (cached && Array.isArray(cached)) {
-          const filtered = cached.filter((d: any) => d.id !== documentId);
-          await this.offlineCache.set(collectionPath, filtered);
-        }
-
-        // Queue for sync when online
-        await this.offlineCache.addPendingWrite({
-          type: 'delete',
-          path,
-        });
-        this.log(RiviumSyncLogLevel.INFO, 'Document delete queued for offline sync');
-      }
+      // Queue for sync when online
+      await this.offlineCache.addPendingWrite({
+        type: 'delete',
+        path,
+      });
+      this.log(RiviumSyncLogLevel.INFO, 'Document delete queued for offline sync');
       return;
     }
 
     // Online: make API call
     try {
-
-      const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
-        method: 'DELETE',
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      await this.deleteDocumentOnServer(databaseId, collectionId, documentId);
 
       // Remove from cache
       if (this.offlineCache) {
         await this.offlineCache.delete(path);
+        await this.putInCachedCollection(collectionPath, documentId, null);
       }
     } catch (error) {
+      // Already gone on the server: deleted, as in Firestore.
+      if (error instanceof RiviumSyncError && error.statusCode === 404) {
+        if (this.offlineCache) {
+          await this.offlineCache.delete(path);
+          await this.putInCachedCollection(collectionPath, documentId, null);
+        }
+        return;
+      }
+
       this.log(RiviumSyncLogLevel.ERROR, 'Failed to delete document:', error);
 
-      // Network error - queue for offline sync
-      if (this.offlineCache) {
+      // The server could not answer - queue for offline sync. A refusal is thrown.
+      if (this.offlineCache && isTransient(error)) {
         await this.offlineCache.delete(path);
-
-        const cached = await this.offlineCache.get(collectionPath);
-        if (cached && Array.isArray(cached)) {
-          const filtered = cached.filter((d: any) => d.id !== documentId);
-          await this.offlineCache.set(collectionPath, filtered);
-        }
+        await this.putInCachedCollection(collectionPath, documentId, null);
 
         await this.offlineCache.addPendingWrite({
           type: 'delete',
@@ -2167,92 +2440,518 @@ class RiviumSync {
         return;
       }
 
-      this.emitError(RiviumSyncErrorCode.DATA_DELETE_FAILED, (error as Error).message);
+      this.reportError(error, RiviumSyncErrorCode.DATA_DELETE_FAILED);
       throw error;
     }
+  }
+
+  /** Report a failed call to the `onError` listeners: the typed error, or `code` for anything else. */
+  private reportError(error: unknown, code: RiviumSyncErrorCode): void {
+    if (error instanceof RiviumSyncError) this.emitTypedError(error);
+    else this.emitError(code, (error as Error)?.message);
+  }
+
+  /** Put a document into the cached list of its collection, or take it out (`null`). */
+  private async putInCachedCollection(collectionPath: string, documentId: string, doc: SyncDocument<any> | null): Promise<void> {
+    if (!this.offlineCache) return;
+    const cached = await this.offlineCache.get(collectionPath);
+    if (doc === null) {
+      if (Array.isArray(cached)) await this.offlineCache.set(collectionPath, cached.filter((d: any) => d?.id !== documentId));
+      return;
+    }
+    const list = Array.isArray(cached) ? cached : [];
+    const idx = list.findIndex((d: any) => d?.id === documentId);
+    if (idx >= 0) list[idx] = doc;
+    else list.push(doc);
+    await this.offlineCache.set(collectionPath, list);
   }
 
   // ==========================================================================
   // Internal - Realtime Listeners
   // ==========================================================================
+  //
+  // A listener asks the server to listen (POST …/listen): the server checks it
+  // against the security rules like a get / query, answers the current result
+  // (the first callback) and a private topic that only this connection may
+  // subscribe to. Changes then arrive there as added / modified / removed
+  // events with versions. Before it expires, or when the signed-in user
+  // changes, the listener is started again and the old one stopped.
+  //
+  // A server without POST …/listen (404) gets the older topic listening.
 
-  listenDocument<T>(databaseId: string, collectionId: string, documentId: string, callback: DocumentListener<T>): Unsubscribe {
-    const path = `/${databaseId}/${collectionId}/${documentId}`;
-    const mqttTopic = this.topicFor(databaseId, collectionId, documentId);
-
-    // Add to listeners
-    if (!this.documentListeners.has(path)) {
-      this.documentListeners.set(path, new Set());
-    }
-    this.documentListeners.get(path)!.add(callback);
-
-    // Subscribe to MQTT topic
-    if (this.mqttClient && this.mqttClient.connected) {
-      this.mqttClient.subscribe(mqttTopic, { qos: RiviumSync.DEFAULT_QOS });
-    }
-
-    // Fetch initial data
-    this.getDocument<T>(databaseId, collectionId, documentId).then((doc) => {
-      callback(doc);
-    }).catch((e) => {
-      this.log(RiviumSyncLogLevel.ERROR, 'Failed to fetch initial document:', e);
+  listenDocument<T>(databaseId: string, collectionId: string, documentId: string, callback: DocumentListener<T>, onError?: ListenerErrorCallback): Unsubscribe {
+    const listener = this.addListener({
+      kind: 'document',
+      databaseId,
+      collectionId,
+      documentId,
+      onDocument: callback as DocumentListener<any>,
+      onError,
     });
-
-    // Return unsubscribe function
-    return () => {
-      const listeners = this.documentListeners.get(path);
-      if (listeners) {
-        listeners.delete(callback);
-        if (listeners.size === 0) {
-          this.documentListeners.delete(path);
-          if (this.mqttClient && this.mqttClient.connected) {
-            this.mqttClient.unsubscribe(mqttTopic);
-          }
-        }
-      }
-    };
+    return () => this.stopListener(listener);
   }
 
-  listenCollection<T>(databaseId: string, collectionId: string, callback: CollectionListener<T>, options?: QueryOptions): Unsubscribe {
-    const path = `/${databaseId}/${collectionId}`;
-    const mqttTopic = this.topicFor(databaseId, collectionId, '+');
+  listenCollection<T>(databaseId: string, collectionId: string, callback: CollectionListener<T>, options?: QueryOptions, onError?: ListenerErrorCallback): Unsubscribe {
+    const listener = this.addListener({
+      kind: 'query',
+      databaseId,
+      collectionId,
+      options,
+      onDocuments: callback as CollectionListener<any>,
+      onError,
+    });
+    return () => this.stopListener(listener);
+  }
 
-    // Add to listeners
-    if (!this.collectionListeners.has(path)) {
-      this.collectionListeners.set(path, new Set());
+  private addListener(init: Pick<ActiveListener, 'kind' | 'databaseId' | 'collectionId' | 'documentId' | 'options' | 'onDocument' | 'onDocuments' | 'onError'>): ActiveListener {
+    const listener: ActiveListener = {
+      ...init,
+      state: new ListenerState(),
+      mode: 'waiting',
+      generation: 0,
+      retryAttempts: 0,
+      refusals: 0,
+    };
+    this.listeners.add(listener);
+
+    if (this.serverListenersAvailable === false) {
+      this.startLegacyListener(listener);
+    } else if (this.realtimeConnected()) {
+      void this.startServerListener(listener);
+    } else if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      // Offline: what the cache has now; the listener starts when the
+      // connection comes back.
+      void this.deliverFromCache(listener);
     }
-    this.collectionListeners.get(path)!.add({ callback, options });
+    return listener;
+  }
 
-    // Subscribe to MQTT topic
-    if (this.mqttClient && this.mqttClient.connected) {
-      this.mqttClient.subscribe(mqttTopic, { qos: RiviumSync.DEFAULT_QOS });
+  /** Read through a function: TypeScript narrows `mode` across awaits. */
+  private isStopped(l: ActiveListener): boolean {
+    return l.mode === 'stopped';
+  }
+
+  private realtimeConnected(): boolean {
+    return !!this.mqttClient && this.mqttClient.connected;
+  }
+
+  private listenerPath(l: ActiveListener): string {
+    return l.kind === 'document' ? `/${l.databaseId}/${l.collectionId}/${l.documentId}` : `/${l.databaseId}/${l.collectionId}`;
+  }
+
+  /** How many documents a query listener asks for: its window (offset + limit). */
+  private listenerFetchLimit(l: ActiveListener): number | undefined {
+    if (!l.options?.limit) return undefined;
+    return (l.options.offset && l.options.offset > 0 ? l.options.offset : 0) + l.options.limit;
+  }
+
+  private listenBody(l: ActiveListener): Record<string, unknown> {
+    const body: Record<string, unknown> = { clientId: this.mqttClientId };
+    if (l.kind === 'document') {
+      body.documentId = l.documentId;
+      return body;
+    }
+    const o = l.options;
+    if (o?.filters && o.filters.length > 0) {
+      body.filters = o.filters.map((f) => ({ field: f.field, operator: f.operator, value: f.value }));
+    }
+    if (o?.orderBy) body.orderBy = { field: o.orderBy, direction: o.orderDirection === 'desc' ? 'desc' : 'asc' };
+    const limit = this.listenerFetchLimit(l);
+    if (limit) body.limit = limit;
+    return body;
+  }
+
+  /** Start (or start again) a server listener: POST …/listen, subscribe, first callback. */
+  private async startServerListener(l: ActiveListener): Promise<void> {
+    if (l.mode === 'stopped' || l.mode === 'legacy') return;
+    const generation = ++l.generation;
+    if (l.retryTimer) {
+      clearTimeout(l.retryTimer);
+      l.retryTimer = undefined;
+    }
+    // While starting again, the old subscription keeps delivering.
+    if (!l.subscriptionId) l.mode = 'starting';
+
+    let response: Response;
+    let user: string | null;
+    try {
+      user = this.tokenUser(await this.ensureUserToken());
+      response = await this.authedFetch(
+        `${this.apiUrl}/databases/${l.databaseId}/collections/${l.collectionId}/listen`,
+        { method: 'POST', body: JSON.stringify(this.listenBody(l)) },
+      );
+    } catch (e) {
+      if (l.generation !== generation || this.isStopped(l)) return;
+      this.log(RiviumSyncLogLevel.WARNING, 'Could not start listener, retrying:', e);
+      this.scheduleListenRetry(l);
+      return;
     }
 
-    // Fetch initial data
-    this.getDocuments<T>(databaseId, collectionId, options).then((docs) => {
-      this.cachedCollections.set(path, docs);
-      callback(docs);
+    let answer: any = null;
+    if (response.ok) answer = await response.json().catch(() => null);
+
+    // Stopped (or started again) while this was in flight: end what the server just made.
+    if (l.generation !== generation || this.isStopped(l)) {
+      if (answer?.subscriptionId) this.unlistenOnServer(l.databaseId, answer.subscriptionId);
+      return;
+    }
+
+    if (response.status === 404) {
+      const body = await response.json().catch(() => null);
+      // A missing route ("Cannot POST …") = a server from before listeners: every
+      // listener uses the older topics from now on.
+      const message = typeof body?.message === 'string' ? body.message : '';
+      if (!body || /^Cannot /.test(message)) this.serverListenersAvailable = false;
+      this.log(RiviumSyncLogLevel.INFO, 'Server listeners not available; using realtime topics');
+      this.dropServerSubscription(l, true);
+      this.startLegacyListener(l);
+      return;
+    }
+
+    if (!response.ok) {
+      const refused = syncErrorFromResponse(response.status, await response.json().catch(() => null));
+      if (refused) {
+        // Never fall back on a 403: the rules said no.
+        this.failListener(l, refused, true);
+        return;
+      }
+      this.log(RiviumSyncLogLevel.WARNING, `Could not start listener (HTTP ${response.status}), retrying`);
+      this.scheduleListenRetry(l);
+      return;
+    }
+
+    if (!answer || typeof answer.subscriptionId !== 'string' || typeof answer.topic !== 'string') {
+      this.log(RiviumSyncLogLevel.WARNING, 'Unexpected listen answer, retrying');
+      this.scheduleListenRetry(l);
+      return;
+    }
+
+    this.serverListenersAvailable = true;
+    l.retryAttempts = 0;
+    this.dropServerSubscription(l, true);
+
+    l.mode = 'server';
+    l.subscriptionId = answer.subscriptionId;
+    l.topic = answer.topic;
+    l.user = user;
+    const expires = Date.parse(answer.expiresAt);
+    l.expiresAt = Number.isFinite(expires) ? expires : Date.now() + RiviumSync.LISTENER_DEFAULT_TTL_MS;
+    this.serverTopics.set(answer.topic, l);
+    this.subscribeServerTopic(l);
+
+    // The first callback: the snapshot from the answer (no duplicate when
+    // started again and nothing changed).
+    if (l.kind === 'document') {
+      l.state.reset(answer.document && typeof answer.document.id === 'string' ? [answer.document] : []);
+    } else {
+      l.state.reset(Array.isArray(answer.documents) ? answer.documents : []);
+    }
+    this.deliver(l);
+    this.scheduleRelisten(l);
+    void this.cacheListenerSnapshot(l);
+  }
+
+  /** Subscribe a server listener's private topic on the current connection. */
+  private subscribeServerTopic(l: ActiveListener): void {
+    if (!this.realtimeConnected() || !l.topic) return;
+    const topic = l.topic;
+    this.mqttClient!.subscribe(topic, { qos: RiviumSync.DEFAULT_QOS }, (err: any, granted: any) => {
+      if (l.topic !== topic || l.mode !== 'server') return;
+      const refused = !!err || (Array.isArray(granted) && granted.some((g: any) => typeof g?.qos === 'number' && g.qos >= 128));
+      if (!refused) {
+        l.refusals = 0;
+        return;
+      }
+      l.refusals++;
+      if (l.refusals === 1) {
+        // The subscription may be gone (expired, cleaned up): a fresh one.
+        void this.startServerListener(l);
+      } else {
+        this.emitError(RiviumSyncErrorCode.SUBSCRIPTION_FAILED, `Could not subscribe to a listener of ${this.listenerPath(l)}`);
+      }
+    });
+  }
+
+  /** Forget a listener's server subscription: unsubscribe and (best effort) DELETE it. */
+  private dropServerSubscription(l: ActiveListener, unlisten: boolean): void {
+    if (!l.subscriptionId) return;
+    if (l.topic) {
+      this.serverTopics.delete(l.topic);
+      if (this.realtimeConnected()) this.mqttClient!.unsubscribe(l.topic);
+    }
+    if (unlisten) this.unlistenOnServer(l.databaseId, l.subscriptionId);
+    l.subscriptionId = undefined;
+    l.topic = undefined;
+    l.expiresAt = undefined;
+  }
+
+  /** DELETE …/listen/{id}. Best effort: a failure is not reported to the app. */
+  private unlistenOnServer(databaseId: string, subscriptionId: string): void {
+    this.authedFetch(`${this.apiUrl}/databases/${databaseId}/listen/${subscriptionId}`, { method: 'DELETE' })
+      .catch((e) => this.log(RiviumSyncLogLevel.DEBUG, 'Stopping a listener on the server failed:', e));
+  }
+
+  private scheduleListenRetry(l: ActiveListener): void {
+    if (l.mode === 'stopped') return;
+    if (!l.subscriptionId) l.mode = 'waiting';
+    const delay = Math.min(2000 * Math.pow(2, l.retryAttempts), 60000);
+    l.retryAttempts++;
+    if (l.retryTimer) clearTimeout(l.retryTimer);
+    l.retryTimer = setTimeout(() => {
+      l.retryTimer = undefined;
+      // Not connected: the connect handler starts it.
+      if (this.realtimeConnected()) void this.startServerListener(l);
+    }, delay);
+    (l.retryTimer as any)?.unref?.();
+  }
+
+  /** Start again about an hour before the server's subscription expires. */
+  private scheduleRelisten(l: ActiveListener): void {
+    if (l.relistenTimer) clearTimeout(l.relistenTimer);
+    l.relistenTimer = undefined;
+    if (!l.expiresAt) return;
+    const remaining = l.expiresAt - Date.now();
+    const delay = remaining > RiviumSync.RELISTEN_BEFORE_EXPIRY_MS * 2
+      ? remaining - RiviumSync.RELISTEN_BEFORE_EXPIRY_MS
+      : Math.max(1000, Math.floor(remaining / 2));
+    l.relistenTimer = setTimeout(() => {
+      l.relistenTimer = undefined;
+      // Not connected: the connect handler sees it is due.
+      if (this.realtimeConnected() && l.mode === 'server') void this.startServerListener(l);
+    }, delay);
+    (l.relistenTimer as any)?.unref?.();
+  }
+
+  /** True when a server listener must be started again rather than re-subscribed. */
+  private listenerNeedsRelisten(l: ActiveListener): boolean {
+    if (!l.subscriptionId) return true;
+    if (l.user !== this.realtimeUser) return true; // signed in / out, another user
+    return !l.expiresAt || l.expiresAt - Date.now() <= RiviumSync.RELISTEN_BEFORE_EXPIRY_MS;
+  }
+
+  /** The app stopped a listener. */
+  private stopListener(l: ActiveListener): void {
+    if (l.mode === 'stopped') return;
+    const wasLegacy = l.mode === 'legacy';
+    l.mode = 'stopped';
+    l.generation++;
+    this.clearListenerTimers(l);
+    this.listeners.delete(l);
+    if (wasLegacy) {
+      this.releaseLegacyTopic(l);
+    } else {
+      this.dropServerSubscription(l, true);
+    }
+  }
+
+  /** The listener ends with an error: the app's error callback, then nothing more. */
+  private failListener(l: ActiveListener, error: RiviumSyncError, unlisten: boolean): void {
+    if (l.mode === 'stopped') return;
+    const wasLegacy = l.mode === 'legacy';
+    l.mode = 'stopped';
+    l.generation++;
+    this.clearListenerTimers(l);
+    this.listeners.delete(l);
+    if (wasLegacy) this.releaseLegacyTopic(l);
+    else this.dropServerSubscription(l, unlisten);
+    if (l.onError) {
+      try {
+        l.onError(error);
+      } catch (e) {
+        this.log(RiviumSyncLogLevel.ERROR, 'Listener error callback threw:', e);
+      }
+    }
+    this.emitTypedError(error);
+  }
+
+  private clearListenerTimers(l: ActiveListener): void {
+    if (l.relistenTimer) clearTimeout(l.relistenTimer);
+    if (l.retryTimer) clearTimeout(l.retryTimer);
+    l.relistenTimer = undefined;
+    l.retryTimer = undefined;
+  }
+
+  /** An event on a listener's private topic. */
+  private applyServerEvent(l: ActiveListener, event: ListenerEvent): void {
+    if (!event || typeof event !== 'object') return;
+    if (event.subscriptionId && event.subscriptionId !== l.subscriptionId) return;
+
+    if (event.type === 'revoked') {
+      if (event.reason === 'expired') {
+        // Ended by time (or a sign-out elsewhere): start it again, transparently.
+        this.dropServerSubscription(l, false);
+        l.mode = 'waiting';
+        if (this.realtimeConnected()) void this.startServerListener(l);
+        return;
+      }
+      // The rules no longer allow it: stop, do not restart.
+      this.failListener(
+        l,
+        new RiviumSyncError(RiviumSyncErrorCode.LISTENER_REVOKED, this.listenerPath(l), { reason: 'listener_revoked' }),
+        false,
+      );
+      return;
+    }
+
+    if (l.kind === 'document' && event.documentId !== l.documentId) return;
+    if (l.state.apply(event)) this.deliver(l);
+  }
+
+  /** Call the app with what the listener shows now, unless it is what it already got. */
+  private deliver(l: ActiveListener): void {
+    if (l.mode === 'stopped') return;
+    if (l.kind === 'document') {
+      const doc = l.state.get(l.documentId!) ?? null;
+      const key = deliveryKey([doc]);
+      if (l.lastKey === key) return;
+      l.lastKey = key;
+      try {
+        l.onDocument?.(doc ? this.toSyncDocument(doc) : null);
+      } catch (e) {
+        this.log(RiviumSyncLogLevel.ERROR, 'Document listener error:', e);
+      }
+      return;
+    }
+
+    // Server listeners only get documents that match; older topics send the
+    // whole collection, so the filters are applied here.
+    let docs = l.state.all();
+    if (l.mode === 'legacy' || l.mode === 'waiting') {
+      if (l.options?.filters?.length) docs = this.applyFilters(docs as SyncDocument<any>[], l.options.filters) as KeptDocument[];
+    }
+    const view = l.state.view(l.options, docs);
+    const key = deliveryKey(view);
+    if (l.lastKey === key) return;
+    l.lastKey = key;
+    try {
+      l.onDocuments?.(view.map((d) => this.toSyncDocument(d)));
+    } catch (e) {
+      this.log(RiviumSyncLogLevel.ERROR, 'Collection listener error:', e);
+    }
+  }
+
+  private toSyncDocument(d: KeptDocument): SyncDocument<any> {
+    const doc: SyncDocument<any> = { id: d.id, data: d.data };
+    if (d.createdAt !== undefined) doc.createdAt = d.createdAt;
+    if (d.updatedAt !== undefined) doc.updatedAt = d.updatedAt;
+    if (d.version !== undefined) doc.version = d.version;
+    return doc;
+  }
+
+  /** Offline at start: what the cache has. Replaced by the server's answer later. */
+  private async deliverFromCache(l: ActiveListener): Promise<void> {
+    if (!this.offlineCache) return;
+    try {
+      if (l.kind === 'document') {
+        const cached = unwrapDocument(await this.offlineCache.get(this.listenerPath(l)));
+        if (!cached || l.mode !== 'waiting' || l.lastKey !== undefined) return;
+        l.state.reset([{ ...cached, id: l.documentId! }]);
+      } else {
+        const cached = await this.offlineCache.get(this.listenerPath(l));
+        if (l.mode !== 'waiting' || l.lastKey !== undefined) return;
+        l.state.reset(Array.isArray(cached) ? cached : []);
+      }
+      this.deliver(l);
+    } catch (e) {
+      this.log(RiviumSyncLogLevel.DEBUG, 'Reading the offline cache failed:', e);
+    }
+  }
+
+  /** Keep the latest server snapshot for offline use. */
+  private async cacheListenerSnapshot(l: ActiveListener): Promise<void> {
+    if (!this.offlineCache) return;
+    try {
+      if (l.kind === 'document') {
+        const doc = l.state.get(l.documentId!);
+        if (doc) await this.offlineCache.set(this.listenerPath(l), this.toSyncDocument(doc));
+      } else if (!l.options?.filters?.length && !l.options?.limit && !l.options?.offset) {
+        // Only the whole collection: a filtered result is not the collection.
+        await this.offlineCache.set(this.listenerPath(l), l.state.all().map((d) => this.toSyncDocument(d)));
+      }
+    } catch (e) {
+      this.log(RiviumSyncLogLevel.DEBUG, 'Writing the offline cache failed:', e);
+    }
+  }
+
+  // --- Older servers: realtime topics --------------------------------------
+
+  /** `…/{collection}/changes` for a query, `…/{collection}/{documentId}` for a document. */
+  private legacyTopic(l: ActiveListener): string {
+    return l.kind === 'document'
+      ? this.topicFor(l.databaseId, l.collectionId, l.documentId)
+      : this.topicFor(l.databaseId, l.collectionId, 'changes');
+  }
+
+  private startLegacyListener(l: ActiveListener): void {
+    if (l.mode === 'stopped') return;
+    l.mode = 'legacy';
+    this.clearListenerTimers(l);
+    if (this.realtimeConnected()) this.mqttClient!.subscribe(this.legacyTopic(l), { qos: RiviumSync.DEFAULT_QOS });
+
+    // First callback: the current data, as before.
+    if (l.kind === 'document') {
+      this.getDocument<any>(l.databaseId, l.collectionId, l.documentId!).then((doc) => {
+        if (l.mode !== 'legacy') return;
+        l.state.reset(doc ? [{ ...doc, id: l.documentId! }] : []);
+        l.lastKey = undefined;
+        this.deliver(l);
+      }).catch((e) => {
+        this.log(RiviumSyncLogLevel.ERROR, 'Failed to fetch initial document:', e);
+      });
+      return;
+    }
+
+    const options: QueryOptions = { ...l.options, offset: undefined, limit: this.listenerFetchLimit(l) };
+    this.getDocuments<any>(l.databaseId, l.collectionId, options).then((docs) => {
+      if (l.mode !== 'legacy') return;
+      l.state.reset(Array.isArray(docs) ? docs : []);
+      l.lastKey = undefined;
+      this.deliver(l);
     }).catch((e) => {
+      if (e instanceof RiviumSyncError && e.reason) {
+        this.failListener(l, e, false);
+        return;
+      }
       this.log(RiviumSyncLogLevel.ERROR, 'Failed to fetch initial collection:', e);
     });
+  }
 
-    // Return unsubscribe function
-    return () => {
-      const listeners = this.collectionListeners.get(path);
-      if (listeners) {
-        const listenerObj = Array.from(listeners).find((l) => l.callback === callback);
-        if (listenerObj) {
-          listeners.delete(listenerObj);
-        }
-        if (listeners.size === 0) {
-          this.collectionListeners.delete(path);
-          this.cachedCollections.delete(path);
-          if (this.mqttClient && this.mqttClient.connected) {
-            this.mqttClient.unsubscribe(mqttTopic);
-          }
-        }
-      }
-    };
+  /** Unsubscribe a stopped listener's topic when no other listener uses it. */
+  private releaseLegacyTopic(l: ActiveListener): void {
+    const topic = this.legacyTopic(l);
+    for (const other of this.listeners) {
+      if (other !== l && other.mode === 'legacy' && this.legacyTopic(other) === topic) return;
+    }
+    if (this.realtimeConnected()) this.mqttClient!.unsubscribe(topic);
+  }
+
+  /** A message on an older realtime topic: `{ type: create | update | delete, documentId, data }`. */
+  private applyLegacyMessage(topic: string, payload: any): void {
+    const parts = topic.split('/');
+    if (parts.length !== 5 || parts[0] !== 'rivium_sync' || !payload || typeof payload !== 'object') return;
+    const [, , databaseId, collectionId, last] = parts;
+    const isCollectionTopic = last === 'changes';
+    const documentId: unknown = isCollectionTopic ? payload.documentId : last;
+    if (typeof documentId !== 'string' || !documentId) return;
+
+    const deleted = payload.type === 'delete' || payload.deleted === true;
+    const event: ListenerEvent = deleted
+      ? { type: 'removed', documentId }
+      : {
+          type: 'modified',
+          documentId,
+          data: payload.data,
+          version: typeof payload.version === 'number' ? payload.version : null,
+          updatedAt: payload.updatedAt ?? payload.timestamp,
+        };
+
+    for (const l of this.listeners) {
+      if (l.mode !== 'legacy' || l.databaseId !== databaseId || l.collectionId !== collectionId) continue;
+      // The collection topic feeds query listeners, a document's topic its
+      // document listeners: each change is applied once.
+      if (isCollectionTopic ? l.kind !== 'query' : l.kind !== 'document' || l.documentId !== documentId) continue;
+      if (l.state.apply(event)) this.deliver(l);
+    }
   }
 
   // ==========================================================================
@@ -2289,12 +2988,15 @@ class RiviumSync {
 
     this.setConnectionState('connecting');
 
-    // Always use WSS for production MQTT host (port 443 = TLS required)
     const wsHost = this.mqttConfig.wsHost || this.mqttConfig.host;
-    const wsProtocol = this.mqttConfig.wsPort === 443 ? 'wss' : 'ws';
-    const url = `${wsProtocol}://${wsHost}:${this.mqttConfig.wsPort}/mqtt`;
+    // Always encrypted (secure WebSocket) to Rivium; plain only to a local
+    // server the app chose with useEmulator.
+    const scheme = this.mqttConfig.useTls === false ? 'ws' : 'wss';
+    const url = `${scheme}://${wsHost}:${this.mqttConfig.wsPort}${RiviumSync.MQTT_WS_PATH}`;
 
-    const clientId = `rivium_sync_web_${this.generateUUID()}`;
+    // One id for this SDK instance: a listener's private topic may only be
+    // received by the client id it was started with, also after a reconnect.
+    const clientId = this.mqttClientId;
 
     const options: IClientOptions = {
       clientId,
@@ -2315,8 +3017,8 @@ class RiviumSync {
       this.setConnectionState('connected');
       this.reconnectAttempts = 0;
 
-      // Resubscribe to all active listeners
-      this.resubscribeAll();
+      // Subscribe every listener again (clean session) and start waiting ones
+      this.onRealtimeConnected();
 
       // Sync pending offline writes
       this.syncPendingWrites();
@@ -2356,6 +3058,8 @@ class RiviumSync {
   }
 
   private scheduleReconnect(): void {
+    // disconnect() / goOffline(): the close that follows is not a drop to recover from.
+    if (!this.wantConnected) return;
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.log(RiviumSyncLogLevel.WARNING, 'Max reconnect attempts reached');
       return;
@@ -2371,35 +3075,36 @@ class RiviumSync {
 
     this.log(RiviumSyncLogLevel.INFO, `Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
+    // A fresh realtime token for every reconnect: the broker checks it only at login, so reusing the first one
+    // was refused for good once it expired (24 h by default). fetchMqttConfig() connects when it has one.
     this.reconnectTimer = setTimeout(() => {
-      this.connectMqtt();
+      void this.fetchMqttConfig();
     }, delay);
   }
 
-  private resubscribeAll(): void {
-    if (!this.mqttClient || !this.mqttClient.connected) return;
-
-    // Resubscribe to document listeners
-    // Topic format: rivium_sync/{projectId}/{databaseName}/{collectionName}/{documentId}
-    this.documentListeners.forEach((_, path) => {
-      const parts = path.split('/').filter((p) => p);
-      if (parts.length === 3) {
-        const [databaseId, collectionId, documentId] = parts;
-        const topic = this.topicFor(databaseId, collectionId, documentId);
-        this.mqttClient!.subscribe(topic, { qos: RiviumSync.DEFAULT_QOS });
+  /** Connected (again): subscribe every listener's topic, start the ones that wait. */
+  private onRealtimeConnected(): void {
+    if (!this.realtimeConnected()) return;
+    const legacyTopics = new Set<string>();
+    for (const l of this.listeners) {
+      switch (l.mode) {
+        case 'legacy':
+          legacyTopics.add(this.legacyTopic(l));
+          break;
+        case 'server':
+          // A clean session: subscribe again, or start again when it is due
+          // or the signed-in user changed.
+          if (this.listenerNeedsRelisten(l)) void this.startServerListener(l);
+          else this.subscribeServerTopic(l);
+          break;
+        case 'waiting':
+          void this.startServerListener(l);
+          break;
+        default:
+          break; // starting: subscribes when the answer comes; stopped: nothing
       }
-    });
-
-    // Resubscribe to collection listeners
-    // Topic format: .../{collectionName}/+ (wildcard for all documents)
-    this.collectionListeners.forEach((_, path) => {
-      const parts = path.split('/').filter((p) => p);
-      if (parts.length === 2) {
-        const [databaseId, collectionId] = parts;
-        const topic = this.topicFor(databaseId, collectionId, '+');
-        this.mqttClient!.subscribe(topic, { qos: RiviumSync.DEFAULT_QOS });
-      }
-    });
+    }
+    legacyTopics.forEach((topic) => this.mqttClient!.subscribe(topic, { qos: RiviumSync.DEFAULT_QOS }));
   }
 
   /**
@@ -2416,94 +3121,15 @@ class RiviumSync {
   private handleMqttMessage(topic: string, data: any): void {
     this.log(RiviumSyncLogLevel.VERBOSE, 'MQTT message received:', topic, data);
 
-    // Parse topic: rivium_sync/{projectId}/{databaseName}/{collectionName}/{documentId}
-    const parts = topic.split('/');
-    if (parts.length < 5) return;
-
-    const databaseId = parts[2];
-    const collectionId = parts[3];
-    const documentId = parts[4];
-
-    const documentPath = `/${databaseId}/${collectionId}/${documentId}`;
-    const collectionPath = `/${databaseId}/${collectionId}`;
-
-    // Notify document listeners
-    const docListeners = this.documentListeners.get(documentPath);
-    if (docListeners) {
-      const document: SyncDocument<any> = {
-        id: documentId,
-        data: data.data || data,
-        createdAt: data.createdAt,
-        updatedAt: data.updatedAt,
-        version: data.version,
-      };
-
-      docListeners.forEach((callback) => {
-        try {
-          if (data.deleted) {
-            callback(null);
-          } else {
-            callback(document);
-          }
-        } catch (e) {
-          this.log(RiviumSyncLogLevel.ERROR, 'Document listener error:', e);
-        }
-      });
+    // A listener's private topic: rivium_sync/{projectId}/s/{subscriptionId}
+    const server = this.serverTopics.get(topic);
+    if (server) {
+      this.applyServerEvent(server, data as ListenerEvent);
+      return;
     }
 
-    // Notify collection listeners
-    const colListeners = this.collectionListeners.get(collectionPath);
-    if (colListeners) {
-      // Update cached collection
-      let docs = this.cachedCollections.get(collectionPath) || [];
-
-      if (data.deleted) {
-        docs = docs.filter((d) => d.id !== documentId);
-      } else {
-        const existingIndex = docs.findIndex((d) => d.id === documentId);
-        const newDoc: SyncDocument<any> = {
-          id: documentId,
-          data: data.data || data,
-          createdAt: data.createdAt,
-          updatedAt: data.updatedAt,
-          version: data.version,
-        };
-
-        if (existingIndex >= 0) {
-          docs[existingIndex] = newDoc;
-        } else {
-          docs.push(newDoc);
-        }
-      }
-
-      this.cachedCollections.set(collectionPath, docs);
-
-      // Notify all listeners with filtered data based on their options
-      colListeners.forEach(({ callback, options }) => {
-        try {
-          let filteredDocs = [...docs];
-
-          // Apply filters
-          if (options?.filters) {
-            filteredDocs = this.applyFilters(filteredDocs, options.filters);
-          }
-
-          // Apply ordering
-          if (options?.orderBy) {
-            filteredDocs = this.applyOrdering(filteredDocs, options.orderBy, options.orderDirection);
-          }
-
-          // Apply limit
-          if (options?.limit) {
-            filteredDocs = filteredDocs.slice(options.offset || 0, (options.offset || 0) + options.limit);
-          }
-
-          callback(filteredDocs);
-        } catch (e) {
-          this.log(RiviumSyncLogLevel.ERROR, 'Collection listener error:', e);
-        }
-      });
-    }
+    // Older topics: rivium_sync/{projectId}/{databaseName}/{collectionName}/{documentId | changes}
+    this.applyLegacyMessage(topic, data);
   }
 
   private applyFilters(docs: SyncDocument<any>[], filters: QueryFilter[]): SyncDocument<any>[] {
@@ -2555,7 +3181,7 @@ class RiviumSync {
   // ==========================================================================
 
   private async syncPendingWrites(): Promise<void> {
-    if (!this.offlineCache || this.isSyncing) return;
+    if (!this.offlineCache || this.isSyncing || this.isKnownOffline()) return;
 
     const pendingWrites = await this.offlineCache.getPendingWrites();
     if (pendingWrites.length === 0) {
@@ -2567,53 +3193,89 @@ class RiviumSync {
     this.setSyncState('syncing');
 
     try {
-      const maxRetries = this.config.maxSyncRetries ?? 3;
+      // Writes of one document go in order: after a refused one the later
+      // ones are dropped too (they build on it), and after one that has to
+      // wait for the next sync the later ones wait as well.
+      const refused = new Set<string>();
+      const waiting = new Set<string>();
+      // A document made offline (temp_ id) → the id the server gave it in this sync.
+      const created = new Map<string, string>();
 
       for (const write of pendingWrites) {
+        const parts = write.path.split('/').filter((p: string) => p);
+        if (parts.length !== 2 && parts.length !== 3) {
+          await this.offlineCache.clearPendingWrite(write.id);
+          continue;
+        }
+        const [databaseId, collectionId] = parts;
+        const collectionPath = `/${databaseId}/${collectionId}`;
+        // The document this write is about (a queued add: its temp id, when it has one).
+        const documentId: string | undefined = parts.length === 3 ? parts[2] : write.tempId;
+        const key = documentId ? `${collectionPath}/${documentId}` : undefined;
+        const isTempDocument = !!documentId && documentId.startsWith('temp_');
+        const serverId = key ? created.get(key) : undefined;
+        const operation: WriteOperation =
+          parts.length === 2 || write.type === 'add' || (isTempDocument && !serverId && write.type !== 'delete')
+            ? 'create'
+            : write.type === 'delete'
+              ? 'delete'
+              : 'update';
+
+        if (key && refused.has(key)) {
+          await this.offlineCache.clearPendingWrite(write.id);
+          continue;
+        }
+        if (key && waiting.has(key)) continue;
+
+        // Create a document made offline, and remember the id the server gave it.
+        const create = async (data: any) => {
+          const serverDoc = await this.addDocumentToServer(databaseId, collectionId, data);
+          if (key && documentId && serverDoc?.id) {
+            created.set(key, serverDoc.id);
+            // The cached temp document becomes the server's.
+            await this.offlineCache!.delete(key);
+            await this.putInCachedCollection(collectionPath, documentId, null);
+            await this.putInCachedCollection(collectionPath, serverDoc.id, serverDoc);
+          }
+        };
+
         try {
-          const parts = write.path.split('/').filter((p: string) => p);
-
-          if (parts.length === 2) {
+          if (parts.length === 2 || write.type === 'add') {
             // Collection add
-            const [databaseId, collectionId] = parts;
-            await this.addDocumentToServer(databaseId, collectionId, write.data);
-          } else if (parts.length === 3) {
-            const [databaseId, collectionId, documentId] = parts;
-
-            // Check if this is a temp document (created offline)
-            const isTempDocument = documentId.startsWith('temp_');
+            await create(write.data);
+          } else {
+            // Temp document (created offline): its server id once it is created in this sync.
+            const target = serverId ?? documentId!;
 
             switch (write.type) {
               case 'set':
-                if (isTempDocument) {
+                if (isTempDocument && !serverId) {
                   // Temp document: create new on server instead of set
-                  await this.addDocumentToServer(databaseId, collectionId, write.data);
+                  await create(write.data);
                 } else {
-                  await this.setDocumentOnServer(databaseId, collectionId, documentId, write.data);
+                  // A set queued by an SDK before 0.3.0 has no flag: it was written
+                  // when set() merged, so it keeps merging.
+                  await this.setDocumentOnServer(databaseId, collectionId, target, write.data, write.merge ?? true);
                 }
                 break;
               case 'update':
-                if (isTempDocument) {
+                if (isTempDocument && !serverId) {
                   // Temp document: create new on server instead of update
                   // Get the full document data from cache if available
-                  const cachedPath = `/${databaseId}/${collectionId}/${documentId}`;
-                  const cached = this.offlineCache ? await this.offlineCache.get(cachedPath) : null;
+                  const cached = unwrapDocument(await this.offlineCache.get(key!));
                   const fullData = cached ? { ...cached.data, ...write.data } : write.data;
-                  await this.addDocumentToServer(databaseId, collectionId, fullData);
+                  await create(fullData);
                 } else {
-                  await this.updateDocumentOnServer(databaseId, collectionId, documentId, write.data);
+                  await this.updateDocumentOnServer(databaseId, collectionId, target, write.data);
                 }
                 break;
               case 'delete':
-                if (isTempDocument) {
+                if (isTempDocument && !serverId) {
                   // Temp document that was never synced - just remove from pending, nothing to delete on server
                   this.log(RiviumSyncLogLevel.DEBUG, 'Skipping delete for temp document:', documentId);
                 } else {
-                  await this.deleteDocumentOnServer(databaseId, collectionId, documentId);
+                  await this.deleteDocumentOnServer(databaseId, collectionId, target);
                 }
-                break;
-              case 'add':
-                await this.addDocumentToServer(databaseId, collectionId, write.data);
                 break;
             }
           }
@@ -2621,12 +3283,19 @@ class RiviumSync {
           await this.offlineCache.clearPendingWrite(write.id);
           this.log(RiviumSyncLogLevel.INFO, 'Synced pending write:', write.path);
         } catch (e) {
-          this.log(RiviumSyncLogLevel.ERROR, 'Failed to sync pending write:', e);
-          // Increment retry count or remove if max retries exceeded
-          if (write.retryCount >= maxRetries) {
-            this.log(RiviumSyncLogLevel.WARNING, 'Max retries exceeded, removing pending write:', write.path);
+          // Already gone on the server: the delete is done.
+          if (write.type === 'delete' && e instanceof RiviumSyncError && e.statusCode === 404) {
             await this.offlineCache.clearPendingWrite(write.id);
+            continue;
           }
+          if (this.isRejection(e)) {
+            const dropped = await this.rollBack(write, databaseId, collectionId, documentId, operation, e as RiviumSyncError);
+            if (key) (dropped ? refused : waiting).add(key);
+            continue;
+          }
+          // The server could not answer: stays queued for the next sync.
+          this.log(RiviumSyncLogLevel.ERROR, 'Failed to sync pending write:', e);
+          if (key) waiting.add(key);
         }
       }
 
@@ -2639,53 +3308,143 @@ class RiviumSync {
     }
   }
 
+  /**
+   * The server's final answer to a queued write (403 refused by the rules,
+   * 400 / 422 invalid...): retrying cannot change it. A 409 is a version
+   * conflict and stays queued, as before.
+   */
+  private isRejection(error: unknown): boolean {
+    return !isTransient(error) && !(error instanceof RiviumSyncError && error.statusCode === 409);
+  }
+
+  /**
+   * Drop a queued write the server refused and put the local copy back to the
+   * server's, as in Firestore: a refused new document disappears, a refused
+   * update, set or delete shows the server's document again (or nothing, when
+   * the user may not read it). Returns false when the server's copy cannot be
+   * read right now: the write then stays queued and the next sync rolls it back.
+   */
+  private async rollBack(
+    write: any,
+    databaseId: string,
+    collectionId: string,
+    documentId: string | undefined,
+    operation: WriteOperation,
+    error: RiviumSyncError,
+  ): Promise<boolean> {
+    const cache = this.offlineCache!;
+    const collectionPath = `/${databaseId}/${collectionId}`;
+    this.log(RiviumSyncLogLevel.WARNING, `Server refused a queued ${operation} of ${documentId ?? collectionPath}, rolling back:`, error.message);
+
+    // A document made offline (temp_ id) was never on the server; anything else is read back.
+    let server: SyncDocument<any> | null = null;
+    if (documentId && !documentId.startsWith('temp_')) {
+      try {
+        server = await this.fetchDocumentFromServer(databaseId, collectionId, documentId);
+      } catch (e) {
+        if (isTransient(e)) {
+          this.log(RiviumSyncLogLevel.WARNING, 'Could not read the server copy, rolling back on the next sync:', e);
+          return false;
+        }
+        server = null; // The user may not read it either: nothing to show.
+      }
+    }
+
+    let rejectedId = documentId;
+    if (documentId) {
+      const path = `${collectionPath}/${documentId}`;
+      if (server) await cache.set(path, server);
+      else await cache.delete(path);
+      await this.putInCachedCollection(collectionPath, documentId, server);
+    } else {
+      // An add queued by an older version has no temp id: find its temp document by the data.
+      const cached = await cache.get(collectionPath);
+      const json = JSON.stringify(write.data);
+      const temp = Array.isArray(cached) ? cached.find((d: any) => typeof d?.id === 'string' && d.id.startsWith('temp_') && JSON.stringify(d.data) === json) : undefined;
+      if (temp) {
+        rejectedId = temp.id;
+        await this.putInCachedCollection(collectionPath, temp.id, null);
+      }
+    }
+
+    await cache.clearPendingWrite(write.id);
+    this.documentRejectedListeners.forEach((listener) => {
+      try {
+        listener(rejectedId ?? '', operation, error);
+      } catch (e) {
+        this.log(RiviumSyncLogLevel.ERROR, 'Document rejected listener threw:', e);
+      }
+    });
+    return true;
+  }
+
   // Direct server operations (bypass offline queue)
+
+  /** GET one document: null when it does not exist; the server's answer is thrown otherwise. */
+  private async fetchDocumentFromServer<T>(databaseId: string, collectionId: string, documentId: string): Promise<SyncDocument<T> | null> {
+    const response = await this.authedFetch(`${this.apiUrl}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+      method: 'GET',
+    });
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (!response.ok) {
+      throw await errorFromResponse(response, RiviumSyncErrorCode.DATA_FETCH_FAILED);
+    }
+
+    // The API answers `{ data: document }`; the app gets the document.
+    return unwrapDocument<T>(await response.json());
+  }
+
   private async addDocumentToServer<T>(databaseId: string, collectionId: string, data: T): Promise<SyncDocument<T>> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk`, {
+    const response = await this.authedFetch(`${this.apiUrl}/databases/${databaseId}/collections/${collectionId}/documents/sdk`, {
       method: 'POST',
       body: JSON.stringify({ data }),
     });
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw await errorFromResponse(response, RiviumSyncErrorCode.DATA_WRITE_FAILED);
     }
 
-    return response.json();
+    return unwrapDocument<T>(await response.json()) as SyncDocument<T>;
   }
 
-  private async setDocumentOnServer<T>(databaseId: string, collectionId: string, documentId: string, data: T): Promise<void> {
+  private async setDocumentOnServer<T>(databaseId: string, collectionId: string, documentId: string, data: T, merge: boolean): Promise<void> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+    // `merge` is always sent: false replaces the document, true merges into it.
+    const response = await this.authedFetch(`${this.apiUrl}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
       method: 'PUT',
-      body: JSON.stringify({ data }),
+      body: JSON.stringify({ data, merge }),
     });
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw await errorFromResponse(response, RiviumSyncErrorCode.DATA_WRITE_FAILED);
     }
   }
 
   private async updateDocumentOnServer<T>(databaseId: string, collectionId: string, documentId: string, data: Partial<T>): Promise<void> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+    const response = await this.authedFetch(`${this.apiUrl}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
       method: 'PATCH',
       body: JSON.stringify({ data }),
     });
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw await errorFromResponse(response, RiviumSyncErrorCode.DATA_WRITE_FAILED);
     }
   }
 
   private async deleteDocumentOnServer(databaseId: string, collectionId: string, documentId: string): Promise<void> {
 
-    const response = await this.authedFetch(`${RiviumSync.DEFAULT_SERVER_URL}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
+    const response = await this.authedFetch(`${this.apiUrl}/databases/${databaseId}/collections/${collectionId}/documents/sdk/${documentId}`, {
       method: 'DELETE',
     });
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw await errorFromResponse(response, RiviumSyncErrorCode.DATA_DELETE_FAILED);
     }
   }
 
@@ -2695,6 +3454,9 @@ class RiviumSync {
 
   private handleOnline(): void {
     this.log(RiviumSyncLogLevel.INFO, 'Network online');
+
+    // Not after the app asked to disconnect: reconnect() does that.
+    if (!this.wantConnected) return;
 
     if (this.connectionState === 'disconnected' && this.mqttConfigFetched) {
       this.connectMqtt();

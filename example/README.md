@@ -9,6 +9,11 @@ A comprehensive example app demonstrating all features of the RiviumSync Web SDK
 - **Query Operations** - Filter, sort, and limit queries
 - **Batch Operations** - Atomic multi-document writes
 - **Offline Support** - IndexedDB caching, pending writes queue, auto-sync
+- **Security Rules** - nine PASS/FAIL checks against the default "owner only" rules, and "Switch user"
+
+Every document the example creates carries `userId` (the signed-in demo user),
+and every list and listener asks for `userId == me`: that is what the default
+"owner only" rules (`.read: data.userId === auth.uid`) allow.
 
 ## Setup
 
@@ -29,7 +34,6 @@ Then edit `src/config.ts` with your credentials:
 export const AppConfig = {
   apiKey: 'your-api-key-here',
   databaseName: 'my-app', // database NAME from Rivium Console, not its UUID
-  baseUrl: 'https://sync.rivium.co',
   todosCollection: 'todos',
 };
 ```
@@ -44,7 +48,7 @@ npm install
 npm run dev
 ```
 
-The app will open at `http://localhost:3000`.
+The app will open at `http://localhost:5199`.
 
 ## Project Structure
 
@@ -196,17 +200,25 @@ const unsubscribe = collection.onSnapshot((documents) => {
 unsubscribe();
 ```
 
-## Running against your own API
+## Security Rules checks
 
-The SDK talks to the hosted API by default. If you run RiviumSync yourself,
-point the example at it in `config.ts`:
+The **Rules** tab runs these against the default "owner only" rules, each
+printing PASS or FAIL:
 
-```typescript
-export const AppConfig = {
-  // ...
-  baseUrl: 'https://your-sync-host',
-};
-```
+1. A write with another user's id is refused with 403 and not queued.
+2. A list with no filter fails with `query_not_allowed` (not the cache).
+3. Another user's todos are refused.
+4. Filters keep their type: `"false"` finds nothing, `false` finds the todo.
+5. `set()` replaces, `set(..., { merge: true })` keeps the other fields.
+6. A listener on one document hears its change.
+7. A batch with one refused write saves nothing.
+8. A write made offline that the rules refuse is rolled back when it is sent
+   (`onDocumentRejected`).
+9. A listener on my todos; publish rules that deny reading todos in the
+   Console to see it stop with `listener_revoked`.
+
+**Switch user** signs in as the second demo user (`<demo user id>-2`), so
+checks 1-3 run the other way round.
 
 ## Requirements
 
@@ -226,8 +238,8 @@ token.
 
 This example therefore has a stand-in backend: `vite.config.ts` adds a
 `POST /api/sync-token` endpoint to the dev server, which calls the Sync API's
-`/users/token` with the server secret and returns a short-lived token for a demo
-user. `src/main.ts` passes that as the SDK's `tokenProvider`, and the SDK sends
+`/users/token` with the server secret and returns a short-lived token for one of
+the two demo users. `src/main.ts` passes that as the SDK's `tokenProvider`, and the SDK sends
 it on every request, refreshing it before it expires.
 
 To turn it on:

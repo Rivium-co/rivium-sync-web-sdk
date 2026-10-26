@@ -11,13 +11,16 @@ import { AppConfig } from './src/config';
  *
  * In a real app this is your own endpoint, behind your own session check, and it
  * passes the id of the user who is actually signed in. This example has no login,
- * so it mints a token for a fixed demo user.
+ * so it mints a token for one of two demo users.
  */
-function syncTokenEndpoint(env: Record<string, string>): Plugin {
+function syncTokenEndpoint(env: Record<string, string>, local: LocalSettings): Plugin {
   const serverSecret = env.RIVIUM_SYNC_SERVER_SECRET ?? '';
-  const apiKey = env.RIVIUM_SYNC_API_KEY || AppConfig.apiKey;
-  const apiUrl = env.RIVIUM_SYNC_API_URL || 'https://sync.rivium.co';
-  const demoUserId = env.RIVIUM_SYNC_DEMO_USER_ID || 'demo-user-1';
+  const apiKey = local.apiKey || AppConfig.apiKey;
+  const apiUrl =
+    env.RIVIUM_SYNC_API_URL ||
+    (local.emulatorHost ? `http://${local.emulatorHost}:${local.emulatorPort ?? 3006}` : 'https://sync.rivium.co');
+  // The two demo users the app can switch between; any other id is refused.
+  const demoUsers = [local.demoUserId, `${local.demoUserId}-2`];
 
   return {
     name: 'rivium-sync-token-endpoint',
@@ -43,6 +46,24 @@ function syncTokenEndpoint(env: Record<string, string>): Plugin {
           return;
         }
 
+        // Which demo user to sign in as (the "Switch user" button). A real
+        // backend takes this from its own session, never from the request.
+        let requested = '';
+        for await (const chunk of req) requested += chunk;
+        const userId = (() => {
+          try {
+            return JSON.parse(requested || '{}').userId || local.demoUserId;
+          } catch {
+            return local.demoUserId;
+          }
+        })();
+        if (!demoUsers.includes(userId)) {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: `Not a demo user: ${userId}` }));
+          return;
+        }
+
         try {
           // The app never sees these two headers; that is the whole point.
           const upstream = await fetch(`${apiUrl}/users/token`, {
@@ -52,14 +73,16 @@ function syncTokenEndpoint(env: Record<string, string>): Plugin {
               'x-api-key': apiKey,
               'x-server-secret': serverSecret,
             },
-            // A real backend uses the signed-in user here, not a constant.
-            body: JSON.stringify({ userId: demoUserId }),
+            // A real backend uses the signed-in user here.
+            body: JSON.stringify({ userId }),
           });
 
-          const body = await upstream.text();
+          const body = await upstream.json().catch(() => ({}));
           res.statusCode = upstream.status;
           res.setHeader('Content-Type', 'application/json');
-          res.end(body);
+          // The answer has `token`, maybe wrapped in `data`; the app gets `{ token }` only.
+          const token = body?.token ?? body?.data?.token;
+          res.end(JSON.stringify(upstream.ok && token ? { token } : { error: body?.message || `Token request failed (${upstream.status})` }));
         } catch (error) {
           res.statusCode = 502;
           res.setHeader('Content-Type', 'application/json');
@@ -70,14 +93,40 @@ function syncTokenEndpoint(env: Record<string, string>): Plugin {
   };
 }
 
+/**
+ * Local values from the (gitignored) .env files: which project and database to
+ * use and, for a Rivium Sync server on this machine, its host. All of them are
+ * safe for the browser; the server secret is not one of them.
+ */
+interface LocalSettings {
+  apiKey?: string;
+  databaseName?: string;
+  emulatorHost?: string;
+  emulatorPort?: number;
+  demoUserId: string;
+}
+
+function localSettings(env: Record<string, string>): LocalSettings {
+  return {
+    apiKey: env.RIVIUM_SYNC_API_KEY || undefined,
+    databaseName: env.RIVIUM_SYNC_DATABASE || undefined,
+    emulatorHost: env.RIVIUM_SYNC_EMULATOR_HOST || undefined,
+    emulatorPort: env.RIVIUM_SYNC_EMULATOR_PORT ? Number(env.RIVIUM_SYNC_EMULATOR_PORT) : undefined,
+    demoUserId: env.RIVIUM_SYNC_DEMO_USER_ID || 'demo-user-1',
+  };
+}
+
 export default defineConfig(({ mode }) => {
   // '' so plain (non-VITE_) names are available here in Node. They are NOT
   // exposed to the browser: only VITE_-prefixed vars are.
   const env = loadEnv(mode, process.cwd(), '');
+  const local = localSettings(env);
 
   return {
-    plugins: [syncTokenEndpoint(env)],
-    server: { port: 3000, open: true },
+    plugins: [syncTokenEndpoint(env, local)],
+    // Only the browser-safe local values (never the server secret).
+    define: { __LOCAL_SETTINGS__: JSON.stringify(local) },
+    server: { port: 5199, open: true }, // 3000 is the local Rivium Console
     build: { outDir: 'dist', sourcemap: true },
   };
 });
