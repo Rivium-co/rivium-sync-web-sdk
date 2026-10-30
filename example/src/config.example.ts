@@ -15,9 +15,6 @@ export const AppConfig = {
   // when you use the name.
   databaseName: 'my-app',
 
-  // To use a Rivium Sync server on this machine instead, see .env.example
-  // (npm run dev:emulator).
-
   // Demo collection name
   todosCollection: 'todos',
 };

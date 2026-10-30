@@ -178,7 +178,6 @@ async function initSDK(): Promise<void> {
     riviumSync = new RiviumSyncClass({
       apiKey: settings.apiKey,
       offlineEnabled: true,
-      // A Rivium Sync server on this machine (RIVIUM_SYNC_EMULATOR_HOST in .env.emulator).
       ...(settings.emulatorHost ? { useEmulator: { host: settings.emulatorHost, port: settings.emulatorPort } } : {}),
       // With a tokenProvider, `auth.uid` in Security Rules is the user your
       // backend named, and it cannot be forged. Without one the SDK falls back

@@ -95,7 +95,7 @@ function syncTokenEndpoint(env: Record<string, string>, local: LocalSettings): P
 
 /**
  * Local values from the (gitignored) .env files: which project and database to
- * use and, for a Rivium Sync server on this machine, its host. All of them are
+ * use. All of them are
  * safe for the browser; the server secret is not one of them.
  */
 interface LocalSettings {
@@ -126,7 +126,7 @@ export default defineConfig(({ mode }) => {
     plugins: [syncTokenEndpoint(env, local)],
     // Only the browser-safe local values (never the server secret).
     define: { __LOCAL_SETTINGS__: JSON.stringify(local) },
-    server: { port: 5199, open: true }, // 3000 is the local Rivium Console
+    server: { port: 5199, open: true },
     build: { outDir: 'dist', sourcemap: true },
   };
 });

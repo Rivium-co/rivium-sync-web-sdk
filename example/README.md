@@ -43,7 +43,7 @@ export const AppConfig = {
 3. **Install dependencies and run**:
 
 ```bash
-cd examples/web_example
+cd example
 npm install
 npm run dev
 ```
@@ -98,10 +98,13 @@ index.html             # Main HTML file
 
 ## SDK Usage Examples
 
-### Initialize SDK (ES Module from CDN)
+### Initialize SDK
+```bash
+npm install @rivium/sync-web
+```
+
 ```typescript
-// Import from CDN
-import RiviumSync from 'https://pub-69e86fbad8904e4a8bd3a1b2d051df1f.r2.dev/web/rivium-web/1.1.0/index.esm.js';
+import RiviumSync from '@rivium/sync-web';
 
 // Instantiate the SDK
 const riviumSync = new RiviumSync({
@@ -111,19 +114,6 @@ const riviumSync = new RiviumSync({
 
 const db = riviumSync.database('my-app');
 const collection = db.collection('todos');
-```
-
-### Initialize SDK (UMD via script tag)
-```html
-<script src="https://pub-69e86fbad8904e4a8bd3a1b2d051df1f.r2.dev/web/rivium-web/1.1.0/index.umd.js"></script>
-<script>
-  const riviumSync = new RiviumSync.default({
-    apiKey: 'your-api-key',
-  });
-
-  const db = riviumSync.database('my-app');
-  const collection = db.collection('todos');
-</script>
 ```
 
 ### CRUD Operations

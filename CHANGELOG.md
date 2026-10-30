@@ -81,7 +81,7 @@
 
 - Every request to the Sync API now carries `X-Rivium-SDK: web/<version>`,
   so the Console can show which SDK and version a project uses. Realtime
-  (MQTT) is unchanged. Exported `SDK_NAME` / `SDK_VERSION`.
+  is unchanged. Exported `SDK_NAME` / `SDK_VERSION`.
 
 ## 0.2.1
 
